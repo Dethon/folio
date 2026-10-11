@@ -91,6 +91,7 @@ Section "Install"
   files_ok:
   SetOverwrite on
 
+  File "${DIST}\LICENSE.txt"
   File "${DIST}\LICENSE.pdfium"
   File "${DIST}\LICENSE.lucide"
   File "/oname=folio.ico" "${ICON}"
@@ -147,6 +148,7 @@ Section "Uninstall"
   not_running:
 
   Delete "$INSTDIR\pdfium.dll"
+  Delete "$INSTDIR\LICENSE.txt"
   Delete "$INSTDIR\LICENSE.pdfium"
   Delete "$INSTDIR\LICENSE.lucide"
   Delete "$INSTDIR\folio.ico"

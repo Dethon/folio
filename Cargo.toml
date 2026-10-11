@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.92"
 description = "A fast, minimal PDF reader"
+license = "MIT"
+repository = "https://github.com/Dethon/folio"
 
 [dependencies]
 iced = { version = "0.14", features = ["image", "svg", "advanced", "tokio"] }

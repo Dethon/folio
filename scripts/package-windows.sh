@@ -50,6 +50,7 @@ rm -rf "$OUT"
 mkdir -p "$OUT"
 cp "$ROOT/target/$TARGET/release/folio.exe" "$OUT/"
 cp "$ROOT/vendor/pdfium/$TARGET/pdfium.dll" "$OUT/"
+cp "$ROOT/LICENSE" "$OUT/LICENSE.txt"
 cp "$ROOT/vendor/pdfium/$TARGET/LICENSE.pdfium" "$OUT/"
 cp "$ROOT/assets/icons/LICENSE" "$OUT/LICENSE.lucide"
 

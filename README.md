@@ -155,6 +155,10 @@ examples/make-icon.rs  renders the icon artwork to .ico / .png / .bmp
   all show Folio's icon.
 - The installer is unsigned.
 
+## Licence
+
+Folio is released under the [MIT licence](LICENSE).
+
 ## Credits
 
 PDFium (BSD-3-Clause / Apache-2.0), binaries from
