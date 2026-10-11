@@ -1,0 +1,535 @@
+//! The document engine.
+//!
+//! PDFium is not thread safe, so a single worker thread owns the library and
+//! the open document. The UI never blocks on it: it publishes what it would
+//! like to have (tiles, thumbnails, text) and receives [`Event`]s as the
+//! worker gets to them. Wanted lists are replaced wholesale on every viewport
+//! change, which means work for content that has scrolled away is simply
+//! never started.
+
+pub mod markdown;
+pub mod print;
+pub mod text;
+mod worker;
+
+use std::collections::VecDeque;
+use std::path::PathBuf;
+use std::sync::{Arc, Condvar, Mutex};
+
+pub use text::{Anchor, Granularity, PageText};
+
+/// Edge length of a render tile in device pixels.
+///
+/// 512² RGBA is 1 MiB, which keeps every tile under the renderer's threshold
+/// for synchronous texture uploads so tiles appear the frame they arrive.
+pub const TILE: u32 = 512;
+
+/// Width in device pixels of page thumbnails.
+pub const THUMBNAIL_WIDTH: u32 = 200;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TileKey {
+    pub page: u32,
+    /// Device pixels per point, as `f32` bits so the key is hashable.
+    pub scale: u32,
+    pub col: u16,
+    pub row: u16,
+}
+
+impl TileKey {
+    pub fn scale(&self) -> f32 {
+        f32::from_bits(self.scale)
+    }
+}
+
+/// Size in device pixels of a page rendered at `scale` pixels per point.
+pub fn page_pixels(size: PageSize, scale: f32) -> (u32, u32) {
+    (
+        ((size.width * scale).round() as u32).max(1),
+        ((size.height * scale).round() as u32).max(1),
+    )
+}
+
+/// Tightly packed RGBA8 pixels.
+pub struct Bitmap {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+impl std::fmt::Debug for Bitmap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Bitmap({}x{})", self.width, self.height)
+    }
+}
+
+/// Page dimensions in points, after rotation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PageSize {
+    pub width: f32,
+    pub height: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct OutlineItem {
+    pub title: String,
+    pub depth: u16,
+    pub page: Option<u32>,
+}
+
+#[derive(Debug)]
+pub struct DocInfo {
+    /// Identifies this load; events carry it so stale ones can be dropped.
+    pub id: u64,
+    pub path: PathBuf,
+    pub title: String,
+    pub pages: Vec<PageSize>,
+    pub outline: Vec<OutlineItem>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobKind {
+    Export,
+    Print,
+}
+
+#[derive(Debug)]
+pub enum Event {
+    Opened(Arc<DocInfo>),
+    OpenFailed {
+        path: PathBuf,
+        error: String,
+    },
+    Tile {
+        doc: u64,
+        key: TileKey,
+        bitmap: Bitmap,
+    },
+    Thumbnail {
+        doc: u64,
+        page: u32,
+        bitmap: Bitmap,
+    },
+    Text {
+        doc: u64,
+        page: u32,
+        text: Arc<PageText>,
+    },
+    Progress {
+        kind: JobKind,
+        done: u32,
+        total: u32,
+    },
+    Copied(String),
+    Exported(PathBuf),
+    Printed,
+    JobFailed {
+        kind: JobKind,
+        error: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CopyRequest {
+    pub from: Anchor,
+    pub to: Anchor,
+    pub granularity: Granularity,
+}
+
+pub(crate) enum Job {
+    Export { dest: PathBuf },
+    Print(print::Target),
+}
+
+#[derive(Default)]
+pub(crate) struct Queue {
+    pub open: Option<PathBuf>,
+    pub tiles: Vec<TileKey>,
+    pub texts: Vec<u32>,
+    pub thumbnails: Vec<u32>,
+    pub copy: Option<CopyRequest>,
+    pub jobs: VecDeque<Job>,
+    pub shutdown: bool,
+}
+
+pub(crate) struct Shared {
+    pub queue: Mutex<Queue>,
+    pub wake: Condvar,
+}
+
+/// Handle to the worker thread. Cheap to clone; the worker stops when the
+/// last handle is dropped.
+#[derive(Clone)]
+pub struct Engine {
+    shared: Arc<Shared>,
+    _guard: Arc<Guard>,
+}
+
+struct Guard(Arc<Shared>);
+
+impl Drop for Guard {
+    fn drop(&mut self) {
+        if let Ok(mut queue) = self.0.queue.lock() {
+            queue.shutdown = true;
+        }
+        self.0.wake.notify_all();
+    }
+}
+
+impl Engine {
+    /// Starts the worker. `emit` is called on the worker thread.
+    pub fn spawn(emit: impl Fn(Event) + Send + 'static) -> Self {
+        let shared = Arc::new(Shared {
+            queue: Mutex::new(Queue::default()),
+            wake: Condvar::new(),
+        });
+
+        std::thread::Builder::new()
+            .name("pdf-engine".into())
+            .spawn({
+                let shared = shared.clone();
+                move || worker::run(shared, Box::new(emit))
+            })
+            .expect("spawn engine thread");
+
+        Self {
+            _guard: Arc::new(Guard(shared.clone())),
+            shared,
+        }
+    }
+
+    fn with_queue(&self, f: impl FnOnce(&mut Queue)) {
+        if let Ok(mut queue) = self.shared.queue.lock() {
+            f(&mut queue);
+        }
+        self.shared.wake.notify_one();
+    }
+
+    /// Opens a document, replacing the current one and cancelling its work.
+    pub fn open(&self, path: PathBuf) {
+        self.with_queue(|queue| {
+            queue.open = Some(path);
+            queue.tiles.clear();
+            queue.texts.clear();
+            queue.thumbnails.clear();
+            queue.copy = None;
+            queue.jobs.clear();
+        });
+    }
+
+    /// Replaces the set of content the UI is missing, most urgent first.
+    pub fn want(&self, tiles: Vec<TileKey>, texts: Vec<u32>, thumbnails: Vec<u32>) {
+        self.with_queue(|queue| {
+            queue.tiles = tiles;
+            queue.texts = texts;
+            queue.thumbnails = thumbnails;
+        });
+    }
+
+    /// Extracts the text between two anchors (in document order); answers
+    /// with [`Event::Copied`].
+    pub fn copy(&self, from: Anchor, to: Anchor, granularity: Granularity) {
+        self.with_queue(|queue| {
+            queue.copy = Some(CopyRequest {
+                from,
+                to,
+                granularity,
+            });
+        });
+    }
+
+    pub fn export_markdown(&self, dest: PathBuf) {
+        self.with_queue(|queue| queue.jobs.push_back(Job::Export { dest }));
+    }
+
+    pub fn print(&self, target: print::Target) {
+        self.with_queue(|queue| queue.jobs.push_back(Job::Print(target)));
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use std::path::PathBuf;
+    use std::sync::mpsc::{self, Receiver};
+    use std::time::Duration;
+
+    use super::*;
+
+    pub(crate) struct Fixture {
+        pub engine: Engine,
+        pub events: Receiver<Event>,
+        pub doc: Arc<DocInfo>,
+    }
+
+    impl Fixture {
+        /// Waits for the first event `pick` accepts.
+        pub fn wait<T>(&self, mut pick: impl FnMut(Event) -> Option<T>) -> T {
+            loop {
+                let event = self
+                    .events
+                    .recv_timeout(Duration::from_secs(20))
+                    .expect("engine answered in time");
+
+                if let Event::OpenFailed { error, .. } | Event::JobFailed { error, .. } = &event {
+                    panic!("engine reported: {error}");
+                }
+
+                if let Some(value) = pick(event) {
+                    return value;
+                }
+            }
+        }
+    }
+
+    /// The sample document, written out where the engine can open it. The
+    /// bytes are embedded so the tests also run on a machine other than the
+    /// one that built them.
+    pub(crate) fn fixture_path() -> PathBuf {
+        static PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+        PATH.get_or_init(|| {
+            let path =
+                std::env::temp_dir().join(format!("folio-fixture-{}.pdf", std::process::id()));
+
+            std::fs::write(&path, include_bytes!("../../tests/fixtures/sample.pdf"))
+                .expect("write fixture");
+            path
+        })
+        .clone()
+    }
+
+    pub(crate) fn open_fixture() -> Fixture {
+        let (sender, events) = mpsc::channel();
+        let engine = Engine::spawn(move |event| {
+            let _ = sender.send(event);
+        });
+
+        engine.open(fixture_path());
+
+        let mut fixture = Fixture {
+            engine,
+            events,
+            doc: Arc::new(DocInfo {
+                id: 0,
+                path: PathBuf::new(),
+                title: String::new(),
+                pages: Vec::new(),
+                outline: Vec::new(),
+            }),
+        };
+
+        fixture.doc = fixture.wait(|event| match event {
+            Event::Opened(doc) => Some(doc),
+            _ => None,
+        });
+
+        fixture
+    }
+
+    #[test]
+    fn describes_the_document() {
+        let fixture = open_fixture();
+        let doc = &fixture.doc;
+
+        assert_eq!(doc.title, "Sample Document");
+        assert_eq!(doc.pages.len(), 2);
+        assert_eq!(
+            doc.pages[0],
+            PageSize {
+                width: 612.0,
+                height: 792.0
+            }
+        );
+
+        let outline: Vec<_> = doc
+            .outline
+            .iter()
+            .map(|item| (item.title.as_str(), item.depth, item.page))
+            .collect();
+
+        assert_eq!(
+            outline,
+            [("Introduction", 0, Some(0)), ("Results", 0, Some(1))]
+        );
+    }
+
+    #[test]
+    fn renders_tiles_at_the_requested_scale() {
+        let fixture = open_fixture();
+        let scale = 2.0f32;
+
+        // At 2 px/pt a letter page is 1224 x 1584: the last column is a
+        // partial tile.
+        let corner = TileKey {
+            page: 0,
+            scale: scale.to_bits(),
+            col: 2,
+            row: 0,
+        };
+        let title = TileKey { col: 0, ..corner };
+
+        fixture.engine.want(vec![title, corner], vec![], vec![]);
+
+        let mut seen = Vec::new();
+
+        while seen.len() < 2 {
+            let (key, bitmap) = fixture.wait(|event| match event {
+                Event::Tile { key, bitmap, .. } => Some((key, bitmap)),
+                _ => None,
+            });
+
+            assert_eq!(bitmap.rgba.len() as u32, bitmap.width * bitmap.height * 4);
+
+            if key == title {
+                assert_eq!((bitmap.width, bitmap.height), (TILE, TILE));
+                // The heading puts ink on this tile, on white paper.
+                assert!(bitmap.rgba.chunks(4).any(|pixel| pixel[0] < 64));
+                assert_eq!(&bitmap.rgba[..4], [255, 255, 255, 255]);
+            } else {
+                assert_eq!((bitmap.width, bitmap.height), (1224 - 2 * TILE, TILE));
+            }
+
+            seen.push(key);
+        }
+    }
+
+    #[test]
+    fn renders_thumbnails() {
+        let fixture = open_fixture();
+
+        fixture.engine.want(vec![], vec![], vec![1]);
+
+        let (page, bitmap) = fixture.wait(|event| match event {
+            Event::Thumbnail { page, bitmap, .. } => Some((page, bitmap)),
+            _ => None,
+        });
+
+        assert_eq!(page, 1);
+        assert_eq!(bitmap.width, THUMBNAIL_WIDTH);
+        assert_eq!(
+            bitmap.height,
+            (792.0 * THUMBNAIL_WIDTH as f32 / 612.0).round() as u32
+        );
+    }
+
+    #[test]
+    fn extracts_text_in_view_space() {
+        let fixture = open_fixture();
+
+        fixture.engine.want(vec![], vec![0], vec![]);
+
+        let text = fixture.wait(|event| match event {
+            Event::Text { page: 0, text, .. } => Some(text),
+            _ => None,
+        });
+
+        let first = &text.lines[0];
+
+        assert_eq!(text.text(first.glyphs.clone()).trim(), "Sample Document");
+        // The title's baseline is 72pt from the top of a 792pt page, so in
+        // view space (origin top-left) the line sits just above y = 72.
+        assert!(
+            first.rect.y0 > 40.0 && first.rect.y1 < 85.0,
+            "{:?}",
+            first.rect
+        );
+        assert!((first.rect.x0 - 72.0).abs() < 3.0, "{:?}", first.rect);
+    }
+
+    #[test]
+    fn copies_a_selection_across_pages() {
+        let fixture = open_fixture();
+
+        fixture.engine.want(vec![], vec![0], vec![]);
+
+        let text = fixture.wait(|event| match event {
+            Event::Text { page: 0, text, .. } => Some(text),
+            _ => None,
+        });
+
+        // From the start of the "second paragraph" line to the end of the
+        // document.
+        let line = text
+            .lines
+            .iter()
+            .find(|line| {
+                text.text(line.glyphs.clone())
+                    .starts_with("The second paragraph")
+            })
+            .expect("line exists");
+
+        fixture.engine.copy(
+            Anchor {
+                page: 0,
+                x: line.rect.x0 - 1.0,
+                y: line.rect.center_y(),
+            },
+            Anchor::end_of(1),
+            Granularity::Char,
+        );
+
+        let copied = fixture.wait(|event| match event {
+            Event::Copied(text) => Some(text),
+            _ => None,
+        });
+
+        assert!(
+            copied.starts_with("The second paragraph is separated"),
+            "{copied:?}"
+        );
+        assert!(copied.contains("first item"), "{copied:?}");
+        assert!(
+            copied.ends_with("closing remarks of the document."),
+            "{copied:?}"
+        );
+        assert!(!copied.contains("Introduction"), "{copied:?}");
+    }
+
+    #[test]
+    fn exports_markdown() {
+        let fixture = open_fixture();
+        let dest = std::env::temp_dir().join(format!("folio-export-{}.md", std::process::id()));
+
+        fixture.engine.export_markdown(dest.clone());
+
+        let written = fixture.wait(|event| match event {
+            Event::Exported(path) => Some(path),
+            _ => None,
+        });
+
+        let markdown = std::fs::read_to_string(&written).expect("export exists");
+        let _ = std::fs::remove_file(&written);
+
+        assert_eq!(
+            markdown,
+            "# Sample Document\n\n\
+             ## Introduction\n\n\
+             This fixture exercises the text layer of the reader. It has enough body text \
+             for the exporter to find the body size, a hyphenated word, and a second \
+             paragraph below.\n\n\
+             The second paragraph is separated by vertical space.\n\n\
+             - first item\n- second item\n\n\
+             ```\nlet answer = 42;\n```\n\n\
+             ## Results\n\n\
+             The second page holds the closing remarks of the document.\n"
+        );
+    }
+
+    #[test]
+    fn reports_files_that_are_not_pdfs() {
+        let (sender, events) = mpsc::channel();
+        let engine = Engine::spawn(move |event| {
+            let _ = sender.send(event);
+        });
+
+        let path = std::env::temp_dir().join(format!("folio-not-a-pdf-{}.txt", std::process::id()));
+        std::fs::write(&path, "plain text").expect("write file");
+
+        engine.open(path);
+
+        match events.recv_timeout(Duration::from_secs(20)) {
+            Ok(Event::OpenFailed { error, .. }) => assert!(error.contains("not a valid PDF")),
+            other => panic!("expected a failure, got {other:?}"),
+        }
+    }
+}

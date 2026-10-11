@@ -1,0 +1,39 @@
+[package]
+name = "folio"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+description = "A fast, minimal PDF reader"
+
+[dependencies]
+iced = { version = "0.14", features = ["image", "svg", "advanced", "tokio"] }
+pdfium-render = { version = "0.9.4", default-features = false, features = ["pdfium_latest", "thread_safe"] }
+rfd = "0.17"
+lru = "0.18"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[target.'cfg(windows)'.dependencies]
+libloading = "0.8"
+memmap2 = "0.9"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_Xps",
+    "Win32_System_Console",
+    "Win32_UI_Controls_Dialogs",
+] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[dev-dependencies]
+iced_test = "0.14"
+# Only for `examples/make-icon`; the same version Iced already pulls in.
+resvg = { version = "0.45", default-features = false }

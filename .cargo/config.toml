@@ -1,0 +1,4 @@
+[env]
+# UI tests drive widgets through a headless renderer; the software backend
+# keeps them independent of the machine's GPU.
+ICED_TEST_BACKEND = "tiny-skia"

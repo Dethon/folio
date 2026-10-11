@@ -1,0 +1,4 @@
+/target
+# Prebuilt PDFium binaries; fetch with scripts/fetch-pdfium.sh
+/vendor/pdfium
+/dist
