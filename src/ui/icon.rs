@@ -48,6 +48,8 @@ icons! {
     FitPage => "move-vertical",
     Document => "file-text",
     Close => "x",
+    Search => "search",
+    ChevronUp => "chevron-up",
 }
 
 impl Icon {

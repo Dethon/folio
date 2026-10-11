@@ -33,6 +33,8 @@ pub struct Options {
     pub select_all: bool,
     /// Show the print dialog as soon as the document has loaded.
     pub print: bool,
+    /// Development aid: start with the find bar open on this query.
+    pub find: Option<String>,
 }
 
 /// Carries a value that cannot be cloned through a message, which must be.
@@ -82,6 +84,12 @@ pub enum Message {
     PrintOwner(isize),
     PrintTarget(Once<Result<Option<print::Target>, String>>),
     ToggleTheme,
+    Find,
+    FindInput(String),
+    /// Enter in the find field.
+    FindSubmit,
+    FindStep(i8),
+    Escape,
     Key(keyboard::Event),
     Window(window::Event),
     ScaleFactor(f32),
@@ -105,14 +113,33 @@ pub struct Toast {
     pub progress: Option<f32>,
 }
 
+/// The find bar.
+#[derive(Debug, Default)]
+pub struct Find {
+    pub open: bool,
+    pub query: String,
+    /// Identifies the latest search, so results of earlier ones are dropped.
+    id: u64,
+    pub searching: bool,
+    /// The search stopped at the engine's limit: there are more matches.
+    pub capped: bool,
+}
+
+impl Find {
+    /// Identifies the find field for focus operations.
+    pub const FIELD: &'static str = "find";
+}
+
 pub struct App {
     engine: Engine,
     pub viewer: Viewer,
     pub sidebar: sidebar::State,
     pub palette: Palette,
     pub page_input: String,
+    pub find: Find,
     pub toast: Option<Toast>,
     pub opening: Option<PathBuf>,
+    modifiers: keyboard::Modifiers,
     options: Options,
     /// Frames to wait before taking the requested screenshot.
     screenshot_countdown: Option<u8>,
@@ -135,8 +162,10 @@ impl App {
                 Palette::DARK
             },
             page_input: String::new(),
+            find: Find::default(),
             toast: None,
             opening: None,
+            modifiers: keyboard::Modifiers::default(),
             options,
             screenshot_countdown: None,
         };
@@ -169,6 +198,7 @@ impl App {
     pub fn subscription(&self) -> Subscription<Message> {
         let mut subscriptions = vec![
             keyboard::listen().map(Message::Key),
+            iced::event::listen_with(escape),
             window::events().map(|(_, event)| Message::Window(event)),
         ];
 
@@ -222,6 +252,7 @@ impl App {
         if self.screenshot_countdown.is_none()
             && self.options.screenshot.is_some()
             && self.opening.is_none()
+            && !self.find.searching
             && self.viewer.has_viewport()
             && wanted.tiles.is_empty()
             && wanted.texts.is_empty()
@@ -238,6 +269,47 @@ impl App {
         if let Some(doc) = self.document().cloned() {
             self.sidebar.follow(Some(&doc), page);
         }
+    }
+
+    /// Searches the document for the find bar's query, from where the reader
+    /// is. A blank query only clears the last search.
+    fn search(&mut self) {
+        let from = self.viewer.begin_search();
+
+        self.find.id += 1;
+        self.find.searching = !self.find.query.trim().is_empty();
+        self.find.capped = false;
+        self.engine
+            .search(self.find.id, self.find.query.clone(), from);
+    }
+
+    fn open_find(&mut self) -> Task<Message> {
+        if self.document().is_none() {
+            return Task::none();
+        }
+
+        // Reopening brings the last query's matches back.
+        if !self.find.open {
+            self.find.open = true;
+            self.search();
+        }
+
+        Task::batch([
+            iced::widget::operation::focus(Find::FIELD),
+            iced::widget::operation::select_all(Find::FIELD),
+        ])
+    }
+
+    fn close_find(&mut self) -> Task<Message> {
+        self.find.open = false;
+        self.find.id += 1;
+        self.find.searching = false;
+        self.engine.search(self.find.id, String::new(), 0);
+        self.viewer.clear_matches();
+
+        // Hand the keyboard back to the document: focusing an id nothing
+        // carries takes focus away from the field.
+        iced::widget::operation::focus(iced::widget::Id::new("document"))
     }
 
     fn refresh_page_input(&mut self) {
@@ -326,8 +398,8 @@ impl App {
                 }
                 self.refresh_page_input();
 
-                // Hand the keyboard back to the document: focusing an id
-                // nothing carries takes focus away from the field.
+                // Hand the keyboard back to the document, as closing the
+                // find bar does.
                 return iced::widget::operation::focus(iced::widget::Id::new("document"));
             }
             Message::Zoom(direction) => self.viewer.zoom_step(direction),
@@ -425,8 +497,28 @@ impl App {
                     Palette::DARK
                 };
             }
+            Message::Find => return self.open_find(),
+            Message::FindInput(query) => {
+                self.find.query = query;
+                self.search();
+            }
+            Message::FindSubmit => {
+                self.viewer
+                    .step_match(if self.modifiers.shift() { -1 } else { 1 });
+            }
+            Message::FindStep(direction) => self.viewer.step_match(direction),
+            Message::Escape => {
+                if self.find.open {
+                    return self.close_find();
+                }
+
+                self.viewer.clear_selection();
+            }
             Message::Key(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
                 return self.key_pressed(key, modifiers);
+            }
+            Message::Key(keyboard::Event::ModifiersChanged(modifiers)) => {
+                self.modifiers = modifiers;
             }
             Message::Key(_) => {}
             Message::Window(event) => match event {
@@ -513,6 +605,16 @@ impl App {
 
                 self.refresh_page_input();
 
+                if let Some(query) = self.options.find.take() {
+                    self.find.open = true;
+                    self.find.query = query;
+                }
+
+                // The find bar stays open across documents, on its query.
+                if self.find.open {
+                    self.search();
+                }
+
                 let print = if std::mem::take(&mut self.options.print) {
                     Task::done(Message::Print)
                 } else {
@@ -540,9 +642,27 @@ impl App {
             engine::Event::Text { doc, page, text } if Some(doc) == current => {
                 self.viewer.insert_text(page, text);
             }
+            engine::Event::Matches {
+                doc,
+                search,
+                matches,
+            } if Some(doc) == current && search == self.find.id => {
+                self.viewer.add_matches(matches);
+            }
+            engine::Event::SearchDone {
+                doc,
+                search,
+                capped,
+            } if Some(doc) == current && search == self.find.id => {
+                self.find.searching = false;
+                self.find.capped = capped;
+                self.viewer.finish_search();
+            }
             engine::Event::Tile { .. }
             | engine::Event::Thumbnail { .. }
-            | engine::Event::Text { .. } => {}
+            | engine::Event::Text { .. }
+            | engine::Event::Matches { .. }
+            | engine::Event::SearchDone { .. } => {}
             engine::Event::Progress { kind, done, total } => {
                 let label = match kind {
                     JobKind::Export => "Exporting to Markdown…",
@@ -586,8 +706,14 @@ impl App {
 
     fn key_pressed(&mut self, key: Key, modifiers: keyboard::Modifiers) -> Task<Message> {
         let command = modifiers.command();
+        let step = if modifiers.shift() { -1 } else { 1 };
 
         match key.as_ref() {
+            Key::Character("f") if command => return self.open_find(),
+            Key::Character("g") if command && self.find.open => self.viewer.step_match(step),
+            Key::Named(Named::F3) if self.find.open => self.viewer.step_match(step),
+            Key::Named(Named::F3) => return self.open_find(),
+            Key::Named(Named::Enter) if self.find.open => self.viewer.step_match(step),
             Key::Character("o") if command => return self.handle(Message::OpenDialog),
             Key::Character("p") if command => return self.handle(Message::Print),
             Key::Character("e") if command => return self.handle(Message::Export),
@@ -603,7 +729,6 @@ impl App {
             Key::Character("0") if command => self.viewer.zoom_to(1.0, None),
             Key::Character("1") if command => self.viewer.set_fit(Fit::Width),
             Key::Character("2") if command => self.viewer.set_fit(Fit::Page),
-            Key::Named(Named::Escape) => self.viewer.clear_selection(),
             Key::Named(Named::ArrowDown) => self.viewer.scroll_by(0.0, 56.0),
             Key::Named(Named::ArrowUp) => self.viewer.scroll_by(0.0, -56.0),
             Key::Named(Named::ArrowRight) => self.viewer.scroll_by(56.0, 0.0),
@@ -618,6 +743,22 @@ impl App {
         }
 
         Task::none()
+    }
+}
+
+/// Escape, whether or not a widget took it: a focused text field does, to
+/// drop its focus, and the key should still close the find bar.
+fn escape(
+    event: iced::Event,
+    _status: iced::event::Status,
+    _window: window::Id,
+) -> Option<Message> {
+    match event {
+        iced::Event::Keyboard(keyboard::Event::KeyPressed {
+            key: Key::Named(Named::Escape),
+            ..
+        }) => Some(Message::Escape),
+        _ => None,
     }
 }
 

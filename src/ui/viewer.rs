@@ -24,7 +24,7 @@ use lru::LruCache;
 
 use crate::engine::text::{self, Rect};
 use crate::engine::{
-    Anchor, Bitmap, DocInfo, Granularity, PageSize, PageText, TILE, TileKey, page_pixels,
+    Anchor, Bitmap, DocInfo, Granularity, Match, PageSize, PageText, TILE, TileKey, page_pixels,
 };
 use crate::ui::theme::Palette;
 
@@ -52,6 +52,11 @@ const SCROLLBAR_INSET: f32 = 3.0;
 const SCROLLBAR_MIN: f32 = 36.0;
 /// Distance a mouse wheel notch scrolls.
 const WHEEL_LINE: f32 = 56.0;
+
+/// How close to the viewport's edges a search match may sit before the view
+/// moves to show it. The top allows for the find bar floating there.
+const REVEAL_TOP: f64 = 72.0;
+const REVEAL_EDGE: f64 = 32.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Fit {
@@ -103,6 +108,13 @@ pub struct Viewer {
     thumbnails: LruCache<u32, image::Handle>,
     texts: LruCache<u32, Arc<PageText>>,
     selection: Option<Selection>,
+    /// Search matches, in document order.
+    matches: Vec<Match>,
+    /// The match the reader is on.
+    current: Option<usize>,
+    /// Where the search counts from: the first match at or after it becomes
+    /// the current one.
+    origin: Anchor,
     /// Sign of the last vertical scroll, to prefetch in that direction.
     heading: f64,
 }
@@ -125,6 +137,9 @@ impl Default for Viewer {
             thumbnails: LruCache::new(NonZeroUsize::new(THUMBNAIL_CACHE).unwrap()),
             texts: LruCache::new(NonZeroUsize::new(TEXT_CACHE).unwrap()),
             selection: None,
+            matches: Vec::new(),
+            current: None,
+            origin: Anchor::start_of(0),
             heading: 1.0,
         }
     }
@@ -154,6 +169,7 @@ impl Viewer {
         self.thumbnails.clear();
         self.texts.clear();
         self.selection = None;
+        self.clear_matches();
         self.scroll_x = 0.0;
         self.scroll_y = 0.0;
         self.fit = Fit::Width;
@@ -364,6 +380,8 @@ impl Viewer {
             return;
         }
 
+        let first = !self.has_viewport();
+
         self.viewport = size;
 
         if self.fit != Fit::Manual {
@@ -371,6 +389,11 @@ impl Viewer {
         }
 
         self.clamp();
+
+        // A match found before the view had a size could not be shown.
+        if first {
+            self.reveal_current();
+        }
     }
 
     pub fn set_scale_factor(&mut self, scale_factor: f32) {
@@ -744,6 +767,170 @@ impl Viewer {
         self.texts.peek(&page).map_or_else(Vec::new, |text| {
             text.rects(text::selected_range(text, page, &from, &to, granularity))
         })
+    }
+
+    // --- Search -----------------------------------------------------------
+
+    /// Forgets the matches of the last search and returns the page the next
+    /// one should start from. The reader's place is kept: a query being
+    /// refined stays on the match it is on while that is in view, and
+    /// otherwise matches count from the top of the view.
+    pub fn begin_search(&mut self) -> u32 {
+        let visible = self.visible_pages();
+
+        self.origin = match self
+            .current
+            .and_then(|current| self.matches.get(current))
+            .filter(|found| visible.contains(&found.page))
+        {
+            Some(found) => Anchor {
+                page: found.page,
+                x: found.rects[0].x0,
+                y: found.rects[0].y0,
+            },
+            None => {
+                let page = self.page_at(self.scroll_y);
+
+                Anchor {
+                    page,
+                    x: f32::NEG_INFINITY,
+                    y: ((self.scroll_y - self.page_top(page)) / self.ppp()) as f32,
+                }
+            }
+        };
+
+        self.clear_matches();
+        self.origin.page
+    }
+
+    pub fn clear_matches(&mut self) {
+        self.matches.clear();
+        self.current = None;
+    }
+
+    /// Takes in the matches of one page, which arrive in the order pages are
+    /// searched: from the origin's page to the end, then from the start.
+    pub fn add_matches(&mut self, matches: Vec<Match>) {
+        let Some(page) = matches.first().map(|found| found.page) else {
+            return;
+        };
+
+        let at = self.matches.partition_point(|found| found.page < page);
+        let count = matches.len();
+
+        // The first match to turn up at or after the origin is the nearest
+        // one ahead of the reader.
+        let nearest = if self.current.is_some() {
+            None
+        } else if page == self.origin.page {
+            let (x, y) = (self.origin.x, self.origin.y);
+
+            matches.iter().position(|found| {
+                let rect = found.rects[0];
+
+                rect.y0 > y + 1.0 || (rect.y0 >= y - 1.0 && rect.x0 >= x - 1.0)
+            })
+        } else {
+            Some(0)
+        };
+
+        self.matches.splice(at..at, matches);
+
+        if let Some(current) = self.current.as_mut() {
+            if *current >= at {
+                *current += count;
+            }
+        } else if let Some(nearest) = nearest {
+            self.current = Some(at + nearest);
+            self.reveal_current();
+        }
+    }
+
+    /// Called once every page has been searched.
+    pub fn finish_search(&mut self) {
+        // Every match lies before the origin: wrap round to the first.
+        if self.current.is_none() && !self.matches.is_empty() {
+            self.current = Some(0);
+            self.reveal_current();
+        }
+    }
+
+    /// Moves to the next match (or the previous, for a negative
+    /// `direction`), wrapping round at either end.
+    pub fn step_match(&mut self, direction: i8) {
+        let count = self.matches.len();
+
+        if count == 0 {
+            return;
+        }
+
+        self.current = Some(match self.current {
+            Some(current) if direction < 0 => (current + count - 1) % count,
+            Some(current) => (current + 1) % count,
+            None => 0,
+        });
+        self.reveal_current();
+    }
+
+    pub fn match_count(&self) -> usize {
+        self.matches.len()
+    }
+
+    /// Position of the current match among all of them, counting from one.
+    pub fn current_match(&self) -> Option<usize> {
+        self.current.map(|current| current + 1)
+    }
+
+    /// The matches on `page`, and the index of the first among all matches.
+    fn matches_on(&self, page: u32) -> (usize, &[Match]) {
+        let start = self.matches.partition_point(|found| found.page < page);
+        let end = self.matches.partition_point(|found| found.page <= page);
+
+        (start, &self.matches[start..end])
+    }
+
+    fn reveal_current(&mut self) {
+        if let Some(found) = self.current.and_then(|current| self.matches.get(current)) {
+            let rect = found
+                .rects
+                .iter()
+                .skip(1)
+                .fold(found.rects[0], |all, rect| all.union(rect));
+
+            self.reveal(found.page, rect);
+        }
+    }
+
+    /// Scrolls just enough to bring a rectangle of a page (in points) into
+    /// comfortable view; not at all if it already is.
+    fn reveal(&mut self, page: u32, rect: Rect) {
+        if page >= self.page_count() || self.viewport.height <= 0.0 {
+            return;
+        }
+
+        let ppp = self.ppp();
+        let (width, height) = (self.viewport.width as f64, self.viewport.height as f64);
+
+        let top = self.page_top(page) + rect.y0 as f64 * ppp;
+        let bottom = self.page_top(page) + rect.y1 as f64 * ppp;
+
+        if top < self.scroll_y + REVEAL_TOP || bottom > self.scroll_y + height - REVEAL_EDGE {
+            // A third of the way down, where the eye rests.
+            let target = top - height / 3.0;
+
+            self.heading = if target < self.scroll_y { -1.0 } else { 1.0 };
+            self.scroll_y = target;
+        }
+
+        let page_left = (self.content_width() - self.size(page).width as f64 * ppp) / 2.0;
+        let left = page_left + rect.x0 as f64 * ppp;
+        let right = page_left + rect.x1 as f64 * ppp;
+
+        if left < self.scroll_x + REVEAL_EDGE || right > self.scroll_x + width - REVEAL_EDGE {
+            self.scroll_x = left - width / 3.0;
+        }
+
+        self.clamp();
     }
 
     // --- Scrollbar --------------------------------------------------------
@@ -1146,6 +1333,32 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for View<'_, Message>
                 let size = viewer.size(page);
                 let (sx, sy) = (rect.width / size.width, rect.height / size.height);
 
+                let (first, matches) = viewer.matches_on(page);
+
+                for (index, found) in matches.iter().enumerate() {
+                    let current = viewer.current == Some(first + index);
+
+                    for highlight in &found.rects {
+                        renderer.fill_quad(
+                            Quad {
+                                bounds: Rectangle {
+                                    x: rect.x + highlight.x0 * sx,
+                                    y: rect.y + highlight.y0 * sy,
+                                    width: highlight.width() * sx,
+                                    height: highlight.height() * sy,
+                                },
+                                border: border::rounded(2.0),
+                                ..Quad::default()
+                            },
+                            if current {
+                                self.palette.found_current
+                            } else {
+                                self.palette.found
+                            },
+                        );
+                    }
+                }
+
                 for highlight in viewer.selection_rects(page) {
                     renderer.fill_quad(
                         Quad {
@@ -1469,6 +1682,126 @@ mod tests {
             }
             other => panic!("expected a zoom, got {other:?}"),
         }
+    }
+
+    /// A search match 50pt wide at (100, `y`) on `page`.
+    fn found(page: u32, start: u32, y: f32) -> Match {
+        Match {
+            page,
+            start,
+            rects: vec![Rect {
+                x0: 100.0,
+                y0: y,
+                x1: 150.0,
+                y1: y + 12.0,
+            }],
+        }
+    }
+
+    /// Whether a match made by [`found`] is in comfortable view.
+    fn in_view(viewer: &Viewer, page: u32, y: f32) -> bool {
+        let top = on_screen(viewer, page, 100.0, y).y as f64;
+        let bottom = on_screen(viewer, page, 100.0, y + 12.0).y as f64;
+
+        top >= REVEAL_TOP - 0.5 && bottom <= 600.0 - REVEAL_EDGE + 0.5
+    }
+
+    #[test]
+    fn search_goes_to_the_nearest_match_ahead() {
+        let mut viewer = viewer(5);
+
+        // A little way into the third page.
+        viewer.go_to_page(2);
+        viewer.scroll_by(0.0, 300.0);
+
+        assert_eq!(viewer.begin_search(), 2);
+
+        // Matches arrive from the reader's page on, then wrap round. The
+        // first on this page has already scrolled past.
+        viewer.add_matches(vec![found(2, 0, 100.0), found(2, 9, 500.0)]);
+        viewer.add_matches(vec![found(4, 0, 50.0)]);
+        viewer.add_matches(vec![found(0, 0, 50.0)]);
+        viewer.finish_search();
+
+        assert_eq!(viewer.match_count(), 4);
+        assert_eq!(viewer.current_match(), Some(3));
+        assert!(in_view(&viewer, 2, 500.0));
+
+        viewer.step_match(1);
+        assert_eq!(viewer.current_match(), Some(4));
+        assert!(in_view(&viewer, 4, 50.0));
+
+        viewer.step_match(1);
+        assert_eq!(viewer.current_match(), Some(1), "wraps to the start");
+        assert!(in_view(&viewer, 0, 50.0));
+
+        viewer.step_match(-1);
+        assert_eq!(viewer.current_match(), Some(4), "and back to the end");
+        assert!(in_view(&viewer, 4, 50.0));
+    }
+
+    #[test]
+    fn search_wraps_when_no_match_lies_ahead() {
+        let mut viewer = viewer(3);
+
+        viewer.go_to_page(1);
+        viewer.scroll_by(0.0, 300.0);
+        viewer.begin_search();
+        viewer.add_matches(vec![found(1, 0, 100.0)]);
+
+        assert_eq!(viewer.current_match(), None, "it may yet turn up ahead");
+
+        viewer.finish_search();
+
+        assert_eq!(viewer.current_match(), Some(1));
+        assert!(in_view(&viewer, 1, 100.0));
+    }
+
+    #[test]
+    fn refining_a_query_stays_on_its_match() {
+        let mut viewer = viewer(3);
+
+        viewer.begin_search();
+        viewer.add_matches(vec![found(0, 0, 100.0), found(0, 5, 300.0)]);
+        viewer.step_match(1);
+
+        assert_eq!(viewer.current_match(), Some(2));
+
+        let scroll = viewer.scroll_y;
+
+        // The longer query still matches at both places.
+        assert_eq!(viewer.begin_search(), 0);
+        assert_eq!(viewer.match_count(), 0);
+
+        viewer.add_matches(vec![found(0, 0, 100.0), found(0, 7, 300.0)]);
+
+        assert_eq!(viewer.current_match(), Some(2));
+        assert_eq!(viewer.scroll_y, scroll, "a match in view does not move");
+    }
+
+    #[test]
+    fn a_match_off_to_the_side_is_scrolled_to() {
+        let mut viewer = viewer(1);
+
+        viewer.zoom_to(4.0, None);
+        viewer.scroll_by(-10_000.0, 0.0);
+        viewer.begin_search();
+        viewer.add_matches(vec![Match {
+            page: 0,
+            start: 0,
+            rects: vec![Rect {
+                x0: 500.0,
+                y0: 30.0,
+                x1: 540.0,
+                y1: 42.0,
+            }],
+        }]);
+        viewer.finish_search();
+
+        let left = on_screen(&viewer, 0, 500.0, 30.0).x;
+        let right = on_screen(&viewer, 0, 540.0, 30.0).x;
+
+        assert!(left >= 0.0 && right <= 800.0, "{left}..{right}");
     }
 
     #[test]

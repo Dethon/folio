@@ -1,7 +1,7 @@
 # Folio
 
-A fast, minimal PDF reader for Windows, written in Rust. It reads, copies
-text, prints, and exports to Markdown — and nothing else.
+A fast, minimal PDF reader for Windows, written in Rust. It reads, searches,
+copies text, prints, and exports to Markdown — and nothing else.
 
 Rendering is [PDFium](https://pdfium.googlesource.com/pdfium/) (the engine in
 Chrome); the interface is [Iced](https://iced.rs) on the GPU.
@@ -11,6 +11,9 @@ Chrome); the interface is [Iced](https://iced.rs) on the GPU.
 - **Reading.** Continuous scroll, zoom from 10 % to 800 %, fit width / fit
   page, outline and page-thumbnail sidebar, light and dark themes, drag and
   drop to open.
+- **Searching.** Ctrl+F finds as you type, starting from where you are, and
+  highlights every match. Case and accents are ignored, a phrase is found
+  across a line break, and so is a word hyphenated over two lines.
 - **Copying.** Drag to select; double-click for a word, triple-click for a
   line, Shift-click to extend, Ctrl+A for everything; Ctrl+C copies.
 - **Printing.** The Windows print dialog, with page ranges. Pages are drawn
@@ -44,6 +47,9 @@ There is also a portable folder, `folio-windows-x64`, that runs from anywhere.
 | Open | Ctrl+O |
 | Print | Ctrl+P |
 | Export as Markdown | Ctrl+E |
+| Find | Ctrl+F |
+| Next / previous match | Enter / Shift+Enter, or F3 / Shift+F3 |
+| Close the find bar | Esc |
 | Copy / Select all / Clear selection | Ctrl+C / Ctrl+A / Esc |
 | Zoom in / out / actual size | Ctrl++ / Ctrl+− / Ctrl+0, or Ctrl+wheel |
 | Fit width / fit page | Ctrl+1 / Ctrl+2 |
@@ -141,7 +147,10 @@ examples/make-icon.rs  renders the icon artwork to .ico / .png / .bmp
 
 ## Not there yet
 
-- Search, clickable links, and password-protected documents.
+- Clickable links and password-protected documents.
+- Search matches whole text only: no whole-word or regular-expression
+  options, a phrase split across two pages is not found, and it stops
+  counting at 20,000 matches.
 - Annotations and form filling (annotations are displayed, not editable).
 - Markdown export only recognises tables that are drawn: a grid, or the
   horizontal rules of a typeset table. Tables laid out by spacing alone stay

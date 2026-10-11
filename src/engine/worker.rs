@@ -8,8 +8,8 @@ use pdfium_render::prelude::*;
 use super::table::Rule;
 use super::text::{self, Glyph, Rect};
 use super::{
-    Bitmap, CopyRequest, DocInfo, Event, Job, JobKind, OutlineItem, PageSize, PageText, Shared,
-    THUMBNAIL_WIDTH, TILE, TileKey, markdown, page_pixels, print,
+    Bitmap, CopyRequest, DocInfo, Event, Job, JobKind, MATCH_LIMIT, Match, OutlineItem, PageSize,
+    PageText, SearchRequest, Shared, THUMBNAIL_WIDTH, TILE, TileKey, markdown, page_pixels, print,
 };
 
 type Emit = Box<dyn Fn(Event) + Send>;
@@ -68,6 +68,7 @@ pub(crate) fn run(shared: Arc<Shared>, emit: Emit) {
             pages: VecDeque::new(),
             recent: VecDeque::new(),
             copy: None,
+            search: None,
             job: None,
         };
 
@@ -124,6 +125,7 @@ fn next_open(shared: &Shared) -> Option<PathBuf> {
         queue.texts.clear();
         queue.thumbnails.clear();
         queue.copy = None;
+        queue.search = None;
         queue.jobs.clear();
 
         queue = shared.wake.wait(queue).ok()?;
@@ -222,6 +224,8 @@ enum Task {
     Thumbnail(u32),
     Copy(CopyRequest),
     CopyStep,
+    Search(SearchRequest),
+    SearchStep,
     Start(Job),
     Step,
 }
@@ -230,6 +234,15 @@ struct Copy {
     request: CopyRequest,
     page: u32,
     out: String,
+}
+
+struct Search {
+    id: u64,
+    needle: text::Needle,
+    from: u32,
+    /// Pages searched so far.
+    done: u32,
+    found: usize,
 }
 
 enum Active {
@@ -258,6 +271,7 @@ struct Session<'s, 'p> {
     pages: VecDeque<(u32, PdfPage<'p>)>,
     recent: VecDeque<(TileKey, Instant)>,
     copy: Option<Copy>,
+    search: Option<Search>,
     job: Option<Active>,
 }
 
@@ -295,6 +309,15 @@ impl<'p> Session<'_, 'p> {
                         break Task::CopyStep;
                     }
 
+                    // So is a search: its results show as the query is typed.
+                    if let Some(request) = queue.search.take() {
+                        break Task::Search(request);
+                    }
+
+                    if self.search.is_some() {
+                        break Task::SearchStep;
+                    }
+
                     if self.job.is_some() {
                         break Task::Step;
                     }
@@ -326,6 +349,18 @@ impl<'p> Session<'_, 'p> {
                     });
                 }
                 Task::CopyStep => self.copy_step(),
+                Task::Search(request) => {
+                    let last = (self.info.pages.len() as u32).saturating_sub(1);
+
+                    self.search = text::Needle::new(&request.query).map(|needle| Search {
+                        id: request.id,
+                        needle,
+                        from: request.from.min(last),
+                        done: 0,
+                        found: 0,
+                    });
+                }
+                Task::SearchStep => self.search_step(),
                 Task::Start(job) => self.start(job),
                 Task::Step => self.step(),
             }
@@ -499,6 +534,65 @@ impl<'p> Session<'_, 'p> {
 
         copy.page += 1;
         self.copy = Some(copy);
+    }
+
+    /// Searches one more page.
+    fn search_step(&mut self) {
+        let Some(mut search) = self.search.take() else {
+            return;
+        };
+
+        let pages = self.info.pages.len() as u32;
+
+        if search.done >= pages || search.found >= MATCH_LIMIT {
+            (self.emit)(Event::SearchDone {
+                doc: self.info.id,
+                search: search.id,
+                capped: search.found >= MATCH_LIMIT,
+            });
+            return;
+        }
+
+        let index = (search.from + search.done) % pages;
+
+        // A search walks the whole document, so a page it has to load is not
+        // kept: that would push the pages on screen out of the cache.
+        let text = match self.pages.iter().find(|(page, _)| *page == index) {
+            Some((_, page)) => extract(page, false),
+            None => self
+                .document
+                .pages()
+                .get(index as PdfPageIndex)
+                .ok()
+                .and_then(|page| extract(&page, false)),
+        };
+
+        if let Some(text) = text {
+            let matches: Vec<Match> = text
+                .find(&search.needle)
+                .into_iter()
+                .map(|range| Match {
+                    page: index,
+                    start: range.start,
+                    rects: text.rects(range),
+                })
+                .filter(|found| !found.rects.is_empty())
+                .take(MATCH_LIMIT - search.found)
+                .collect();
+
+            if !matches.is_empty() {
+                search.found += matches.len();
+
+                (self.emit)(Event::Matches {
+                    doc: self.info.id,
+                    search: search.id,
+                    matches,
+                });
+            }
+        }
+
+        search.done += 1;
+        self.search = Some(search);
     }
 
     /// Advances the active job by one page.

@@ -8,11 +8,12 @@ pub mod viewer;
 use std::time::Duration;
 
 use iced::widget::{
-    button, column, container, progress_bar, row, space, stack, text, text_input, tooltip,
+    button, column, container, mouse_area, progress_bar, row, space, stack, text, text_input,
+    tooltip,
 };
-use iced::{Center, Element, Fill, Font, border, font};
+use iced::{Center, Element, Fill, Font, Padding, border, font, mouse};
 
-use crate::app::{App, Message, Tone};
+use crate::app::{App, Find, Message, Tone};
 use icon::Icon;
 use theme::Palette;
 use viewer::Fit;
@@ -52,19 +53,31 @@ pub fn view(app: &App) -> Element<'_, Message> {
         .height(Fill)
         .style(move |_| theme::canvas(palette));
 
-    let main: Element<'_, Message> = match &app.toast {
-        Some(toast) => stack![
-            main,
+    let mut main = stack![main];
+
+    if app.find.open && app.viewer.document().is_some() {
+        main = main.push(
+            container(find_bar(app))
+                .width(Fill)
+                .height(Fill)
+                .align_right(Fill)
+                // Clear of the page view's scrollbar.
+                .padding(Padding::new(12.0).right(22.0)),
+        );
+    }
+
+    if let Some(toast) = &app.toast {
+        main = main.push(
             container(toast_view(palette, toast))
                 .width(Fill)
                 .height(Fill)
                 .align_x(Center)
                 .align_bottom(Fill)
                 .padding(24),
-        ]
-        .into(),
-        None => main.into(),
-    };
+        );
+    }
+
+    let main: Element<'_, Message> = main.into();
 
     let body: Element<'_, Message> = if app.sidebar.open {
         row![sidebar::view(app), vertical_rule(palette), main].into()
@@ -249,6 +262,13 @@ fn toolbar(app: &App) -> Element<'_, Message> {
         row![
             tool(
                 palette,
+                Icon::Search,
+                "Find  Ctrl+F",
+                when_open(Message::Find),
+                app.find.open,
+            ),
+            tool(
+                palette,
                 Icon::Export,
                 "Export as Markdown  Ctrl+E",
                 when_open(Message::Export),
@@ -290,6 +310,72 @@ fn toolbar(app: &App) -> Element<'_, Message> {
         .align_y(Center)
         .style(move |_| theme::surface(palette))
         .into()
+}
+
+/// The find bar, floating over the top right of the page view.
+fn find_bar(app: &App) -> Element<'_, Message> {
+    let palette = app.palette;
+    let find = &app.find;
+    let count = app.viewer.match_count();
+    let more = if find.capped { "+" } else { "" };
+
+    let (status, color) = match (count, app.viewer.current_match()) {
+        (0, _) if find.query.trim().is_empty() => (String::new(), palette.muted),
+        (0, _) if find.searching => ("Searching…".into(), palette.muted),
+        (0, _) => ("No results".into(), palette.danger),
+        (_, Some(current)) => (format!("{current} of {count}{more}"), palette.muted),
+        (_, None) => (format!("{count}{more}"), palette.muted),
+    };
+
+    let field = text_input("Find in document", &find.query)
+        .id(Find::FIELD)
+        .on_input(Message::FindInput)
+        .on_submit(Message::FindSubmit)
+        .size(theme::TEXT)
+        .padding([4, 6])
+        .width(210)
+        .style(move |_, status| theme::input(palette, status));
+
+    let step = |direction: i8| (count > 0).then_some(Message::FindStep(direction));
+
+    let bar = container(
+        row![
+            Icon::Search.view(15.0, palette.muted),
+            space().width(8),
+            field,
+            container(
+                text(status)
+                    .size(theme::TEXT_SMALL)
+                    .color(color)
+                    .wrapping(text::Wrapping::None)
+            )
+            .width(96)
+            .align_x(iced::Right)
+            .padding([0, 8]),
+            tool(
+                palette,
+                Icon::ChevronUp,
+                "Previous  Shift+Enter",
+                step(-1),
+                false
+            ),
+            tool(palette, Icon::ChevronDown, "Next  Enter", step(1), false),
+            tool(
+                palette,
+                Icon::Close,
+                "Close  Esc",
+                Some(Message::Escape),
+                false
+            ),
+        ]
+        .spacing(2)
+        .align_y(Center),
+    )
+    .padding(Padding::new(6.0).left(10.0))
+    .style(move |_| theme::popover(palette));
+
+    // Clicks on the bar itself stay off the page beneath it.
+    mouse_area(bar).interaction(mouse::Interaction::Idle).into()
 }
 
 fn welcome(app: &App) -> Element<'_, Message> {

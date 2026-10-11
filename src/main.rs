@@ -58,8 +58,9 @@ fn main() -> iced::Result {
             "--sidebar" => options.sidebar = args.next(),
             "--print" => options.print = true,
             // Undocumented development aids: start with everything selected;
-            // render one frame to a PNG and exit.
+            // start with a search made; render one frame to a PNG and exit.
             "--select-all" => options.select_all = true,
+            "--find" => options.find = args.next(),
             "--screenshot" => options.screenshot = args.next().map(PathBuf::from),
             _ => options.file = Some(PathBuf::from(arg)),
         }

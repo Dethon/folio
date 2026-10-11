@@ -33,6 +33,10 @@ pub struct Palette {
     /// Selected rows and toggled buttons.
     pub accent_soft: Color,
     pub selection: Color,
+    /// Search matches, and the one the reader is on. Both sit on the paper,
+    /// which is white in either theme.
+    pub found: Color,
+    pub found_current: Color,
     pub danger: Color,
     pub shadow: Color,
     pub scrollbar: Color,
@@ -67,6 +71,8 @@ impl Palette {
         on_accent: rgb(0x0e1626),
         accent_soft: rgba(0x6ea8f7, 0.16),
         selection: rgba(0x4d8ef5, 0.36),
+        found: rgba(0xffc400, 0.40),
+        found_current: rgba(0xff7a00, 0.58),
         danger: rgb(0xf0736c),
         shadow: rgba(0x000000, 0.55),
         scrollbar: rgba(0xffffff, 0.22),
@@ -87,6 +93,8 @@ impl Palette {
         on_accent: rgb(0xffffff),
         accent_soft: rgba(0x2f6fe4, 0.12),
         selection: rgba(0x2f6fe4, 0.30),
+        found: rgba(0xffc400, 0.40),
+        found_current: rgba(0xff7a00, 0.58),
         danger: rgb(0xd1423b),
         shadow: rgba(0x1a2233, 0.22),
         scrollbar: rgba(0x0f1728, 0.26),

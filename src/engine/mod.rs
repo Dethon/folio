@@ -17,7 +17,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 
-pub use text::{Anchor, Granularity, PageText};
+pub use text::{Anchor, Granularity, PageText, Rect};
 
 /// Edge length of a render tile in device pixels.
 ///
@@ -27,6 +27,10 @@ pub const TILE: u32 = 512;
 
 /// Width in device pixels of page thumbnails.
 pub const THUMBNAIL_WIDTH: u32 = 200;
+
+/// A search stops after this many matches: beyond it nobody is stepping
+/// through them, and the list would only cost memory.
+pub const MATCH_LIMIT: usize = 20_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TileKey {
@@ -88,6 +92,16 @@ pub struct DocInfo {
     pub outline: Vec<OutlineItem>,
 }
 
+/// One occurrence of a search query.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Match {
+    pub page: u32,
+    /// Index of the first glyph, which orders the matches of a page.
+    pub start: u32,
+    /// One rectangle in page space per line the match touches.
+    pub rects: Vec<Rect>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobKind {
     Export,
@@ -122,6 +136,19 @@ pub enum Event {
         total: u32,
     },
     Copied(String),
+    /// The matches of one page. Pages arrive in the order they are searched,
+    /// which starts from the page the search was asked from.
+    Matches {
+        doc: u64,
+        search: u64,
+        matches: Vec<Match>,
+    },
+    /// Every page has been searched, or the search hit [`MATCH_LIMIT`].
+    SearchDone {
+        doc: u64,
+        search: u64,
+        capped: bool,
+    },
     Exported(PathBuf),
     Printed,
     JobFailed {
@@ -137,6 +164,12 @@ pub(crate) struct CopyRequest {
     pub granularity: Granularity,
 }
 
+pub(crate) struct SearchRequest {
+    pub id: u64,
+    pub query: String,
+    pub from: u32,
+}
+
 pub(crate) enum Job {
     Export { dest: PathBuf },
     Print(print::Target),
@@ -149,6 +182,7 @@ pub(crate) struct Queue {
     pub texts: Vec<u32>,
     pub thumbnails: Vec<u32>,
     pub copy: Option<CopyRequest>,
+    pub search: Option<SearchRequest>,
     pub jobs: VecDeque<Job>,
     pub shutdown: bool,
 }
@@ -214,6 +248,7 @@ impl Engine {
             queue.texts.clear();
             queue.thumbnails.clear();
             queue.copy = None;
+            queue.search = None;
             queue.jobs.clear();
         });
     }
@@ -237,6 +272,14 @@ impl Engine {
                 granularity,
             });
         });
+    }
+
+    /// Searches the document for `query`, starting at page `from` and
+    /// wrapping round; answers with [`Event::Matches`] as pages turn some up
+    /// and [`Event::SearchDone`] at the end, each carrying `id`. Replaces any
+    /// search still running, and a blank query only does that.
+    pub fn search(&self, id: u64, query: String, from: u32) {
+        self.with_queue(|queue| queue.search = Some(SearchRequest { id, query, from }));
     }
 
     pub fn export_markdown(&self, dest: PathBuf) {
@@ -484,6 +527,84 @@ pub(crate) mod tests {
             "{copied:?}"
         );
         assert!(!copied.contains("Introduction"), "{copied:?}");
+    }
+
+    /// Runs a search to its end, returning the matches in arrival order.
+    fn search(fixture: &Fixture, id: u64, query: &str, from: u32) -> Vec<Match> {
+        let mut found = Vec::new();
+
+        fixture.engine.search(id, query.into(), from);
+
+        fixture.wait(|event| match event {
+            Event::Matches {
+                search, matches, ..
+            } if search == id => {
+                found.extend(matches);
+                None
+            }
+            Event::SearchDone { search, capped, .. } if search == id => {
+                assert!(!capped);
+                Some(())
+            }
+            _ => None,
+        });
+
+        found
+    }
+
+    #[test]
+    fn searches_the_document() {
+        let fixture = open_fixture();
+
+        // Twice on the first page, in any case, with a highlight each.
+        let found = search(&fixture, 1, "PARAGRAPH", 0);
+
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(found.iter().all(|found| found.page == 0));
+        assert!(found[0].start < found[1].start);
+
+        for found in &found {
+            let [rect] = found.rects[..] else {
+                panic!("one line each: {found:?}");
+            };
+
+            assert!(rect.x0 >= 70.0 && rect.x1 <= 545.0, "{rect:?}");
+            assert!(rect.width() > 30.0 && rect.height() > 6.0, "{rect:?}");
+        }
+
+        // A word the fixture breaks across two lines with a hyphen.
+        let found = search(&fixture, 2, "hyphenated", 0);
+
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].rects.len(), 2, "{found:?}");
+
+        // Pages are searched from the one asked for, wrapping round.
+        let pages: Vec<u32> = search(&fixture, 3, "the", 1)
+            .iter()
+            .map(|found| found.page)
+            .collect();
+        let first_page = pages.iter().position(|page| *page == 0).expect("on page 1");
+
+        assert_eq!(pages[0], 1, "{pages:?}");
+        assert!(
+            pages[first_page..].iter().all(|page| *page == 0),
+            "{pages:?}"
+        );
+
+        assert!(search(&fixture, 4, "no such words", 0).is_empty());
+    }
+
+    #[test]
+    fn a_new_search_replaces_the_one_running() {
+        let fixture = open_fixture();
+
+        fixture.engine.search(1, "the".into(), 0);
+        fixture.engine.search(2, "   ".into(), 0);
+
+        let found = search(&fixture, 3, "closing remarks", 0);
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].page, 1);
     }
 
     #[test]

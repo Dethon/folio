@@ -332,6 +332,175 @@ impl PageText {
     }
 }
 
+/// A search query, folded the way page text is folded for matching: case,
+/// accents and typographic variants are ignored, and any run of whitespace
+/// counts as one space.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Needle(Vec<char>);
+
+impl Needle {
+    /// `None` when the query holds nothing to look for.
+    pub fn new(query: &str) -> Option<Self> {
+        let mut chars = Vec::new();
+
+        for ch in query.chars() {
+            if ch.is_whitespace() {
+                if chars.last().is_some_and(|last| *last != ' ') {
+                    chars.push(' ');
+                }
+            } else {
+                fold(ch, |ch| chars.push(ch));
+            }
+        }
+
+        if chars.last() == Some(&' ') {
+            chars.pop();
+        }
+
+        (!chars.is_empty()).then_some(Self(chars))
+    }
+}
+
+/// One folded character of a page, and the glyph it came from.
+struct Folded {
+    ch: char,
+    glyph: u32,
+    /// A hyphen that breaks a word at the end of a line. A query matches
+    /// with or without it.
+    soft: bool,
+}
+
+impl PageText {
+    /// Every occurrence of `needle`, as glyph ranges in reading order.
+    /// Occurrences may run across line ends but do not overlap.
+    pub fn find(&self, needle: &Needle) -> Vec<Range<u32>> {
+        let mut folded: Vec<Folded> = Vec::with_capacity(self.glyphs.len());
+        let space = |folded: &mut Vec<Folded>, glyph: u32| {
+            if folded.last().is_some_and(|last| last.ch != ' ') {
+                folded.push(Folded {
+                    ch: ' ',
+                    glyph,
+                    soft: false,
+                });
+            }
+        };
+
+        for (index, line) in self.lines.iter().enumerate() {
+            let end = self.visible_end(line);
+            let breaks_word = index + 1 < self.lines.len()
+                && end >= line.glyphs.start + 2
+                && self.glyphs[end as usize - 1].ch == '-'
+                && self.glyphs[end as usize - 2].ch.is_alphabetic();
+
+            for glyph in line.glyphs.start..end {
+                let ch = self.glyphs[glyph as usize].ch;
+
+                if ch.is_whitespace() {
+                    space(&mut folded, glyph);
+                } else {
+                    let soft = breaks_word && glyph + 1 == end;
+
+                    fold(ch, |ch| folded.push(Folded { ch, glyph, soft }));
+                }
+            }
+
+            // The end of a line separates words, unless it splits one.
+            if !breaks_word {
+                space(&mut folded, end);
+            }
+        }
+
+        let mut found = Vec::new();
+        let mut start = 0;
+
+        while start < folded.len() {
+            match match_at(&folded, start, &needle.0) {
+                Some(end) => {
+                    found.push(folded[start].glyph..folded[end - 1].glyph + 1);
+                    start = end;
+                }
+                None => start += 1,
+            }
+        }
+
+        found
+    }
+}
+
+/// Where the match of `needle` beginning at `start` ends, if there is one.
+fn match_at(folded: &[Folded], start: usize, needle: &[char]) -> Option<usize> {
+    let mut at = start;
+
+    for (index, wanted) in needle.iter().enumerate() {
+        loop {
+            let have = folded.get(at)?;
+
+            at += 1;
+
+            if have.ch == *wanted {
+                break;
+            }
+
+            // A match steps over a soft hyphen, but does not begin on one.
+            if !have.soft || index == 0 {
+                return None;
+            }
+        }
+    }
+
+    Some(at)
+}
+
+/// Reduces a character to what search compares: lower case, without
+/// accents, with ligatures spelled out and typographic quotes and hyphens
+/// as their plain forms.
+fn fold(ch: char, mut push: impl FnMut(char)) {
+    for ch in ch.to_lowercase() {
+        match ch {
+            // Combining marks: accents stored apart from their letter.
+            '\u{300}'..='\u{36f}' => {}
+            'ß' => "ss".chars().for_each(&mut push),
+            'æ' => "ae".chars().for_each(&mut push),
+            'œ' => "oe".chars().for_each(&mut push),
+            'ﬀ' => "ff".chars().for_each(&mut push),
+            'ﬁ' => "fi".chars().for_each(&mut push),
+            'ﬂ' => "fl".chars().for_each(&mut push),
+            'ﬃ' => "ffi".chars().for_each(&mut push),
+            'ﬄ' => "ffl".chars().for_each(&mut push),
+            '‘' | '’' | 'ʼ' => push('\''),
+            '“' | '”' => push('"'),
+            '\u{2010}' | '\u{2011}' => push('-'),
+            _ => push(unaccented(ch)),
+        }
+    }
+}
+
+/// The base letter of an accented lower-case Latin letter.
+fn unaccented(ch: char) -> char {
+    match ch {
+        'à'..='å' | 'ā' | 'ă' | 'ą' => 'a',
+        'ç' | 'ć' | 'ĉ' | 'ċ' | 'č' => 'c',
+        'ď' | 'đ' => 'd',
+        'è'..='ë' | 'ē' | 'ĕ' | 'ė' | 'ę' | 'ě' => 'e',
+        'ĝ' | 'ğ' | 'ġ' | 'ģ' => 'g',
+        'ĥ' | 'ħ' => 'h',
+        'ì'..='ï' | 'ĩ' | 'ī' | 'ĭ' | 'į' | 'ı' => 'i',
+        'ĵ' => 'j',
+        'ķ' => 'k',
+        'ĺ' | 'ļ' | 'ľ' | 'ŀ' | 'ł' => 'l',
+        'ñ' | 'ń' | 'ņ' | 'ň' => 'n',
+        'ò'..='ö' | 'ø' | 'ō' | 'ŏ' | 'ő' => 'o',
+        'ŕ' | 'ŗ' | 'ř' => 'r',
+        'ś' | 'ŝ' | 'ş' | 'š' => 's',
+        'ţ' | 'ť' | 'ŧ' => 't',
+        'ù'..='ü' | 'ũ' | 'ū' | 'ŭ' | 'ů' | 'ű' | 'ų' => 'u',
+        'ŵ' => 'w',
+        'ý' | 'ÿ' | 'ŷ' => 'y',
+        'ź' | 'ż' | 'ž' => 'z',
+        _ => ch,
+    }
+}
+
 fn is_word_char(ch: char) -> bool {
     ch.is_alphanumeric() || ch == '_' || ch == '\'' || ch == '’'
 }
@@ -520,5 +689,91 @@ mod tests {
             0..8
         );
         assert_eq!(text.rects(3..8).len(), 2);
+    }
+
+    /// Lays `lines` out one under another, a generated space between words
+    /// and a generated break after each line.
+    fn page(lines: &[&str]) -> PageText {
+        let mut glyphs = Vec::new();
+
+        for (row, line) in lines.iter().enumerate() {
+            for (column, ch) in line.chars().enumerate() {
+                glyphs.push(if ch == ' ' {
+                    generated(' ')
+                } else {
+                    glyph(ch, column as f32 * 10.0, row as f32 * 20.0)
+                });
+            }
+
+            glyphs.push(generated('\n'));
+        }
+
+        PageText::new(glyphs)
+    }
+
+    fn found(text: &PageText, query: &str) -> Vec<String> {
+        let needle = Needle::new(query).expect("query is not empty");
+
+        text.find(&needle)
+            .into_iter()
+            .map(|range| text.text(range))
+            .collect()
+    }
+
+    #[test]
+    fn finds_text_whatever_its_case_or_accents() {
+        let text = page(&["The Página, the pagina", "and the PAGE"]);
+
+        assert_eq!(found(&text, "the"), ["The", "the", "the"]);
+        assert_eq!(found(&text, "pagina"), ["Página", "pagina"]);
+        assert_eq!(found(&text, "PÁGINA"), ["Página", "pagina"]);
+        assert!(found(&text, "pages").is_empty());
+    }
+
+    #[test]
+    fn finds_phrases_across_line_ends() {
+        let text = page(&["one two", "three four"]);
+
+        assert_eq!(found(&text, "two  three"), ["two\nthree"]);
+        assert_eq!(
+            text.rects(text.find(&Needle::new("two three").unwrap())[0].clone())
+                .len(),
+            2
+        );
+        // Words on different lines do not run together.
+        assert!(found(&text, "twothree").is_empty());
+    }
+
+    #[test]
+    fn finds_words_hyphenated_across_lines() {
+        let text = page(&["a hyphen-", "ated word and a well-", "known one, 3 -", "4"]);
+
+        assert_eq!(found(&text, "hyphenated"), ["hyphen-\nated"]);
+        assert_eq!(found(&text, "well-known"), ["well-\nknown"]);
+        assert_eq!(found(&text, "hyphen"), ["hyphen"]);
+        // A hyphen that does not follow a letter is not a word break.
+        assert!(found(&text, "34").is_empty());
+        assert_eq!(found(&text, "3 - 4"), ["3 -\n4"]);
+    }
+
+    #[test]
+    fn matches_do_not_overlap() {
+        let text = page(&["aaaa"]);
+
+        assert_eq!(found(&text, "aa").len(), 2);
+    }
+
+    #[test]
+    fn folds_ligatures_and_quotes() {
+        let text = page(&["ﬁne don’t"]);
+
+        assert_eq!(found(&text, "fine"), ["ﬁne"]);
+        assert_eq!(found(&text, "don't"), ["don’t"]);
+    }
+
+    #[test]
+    fn blank_queries_look_for_nothing() {
+        assert_eq!(Needle::new("  \t "), None);
+        assert_eq!(Needle::new(" A  b "), Needle::new("a b"));
     }
 }
