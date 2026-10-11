@@ -4,6 +4,10 @@
       <stop offset="0" stop-color="#ffffff"/>
       <stop offset="1" stop-color="#f1f4f9"/>
     </linearGradient>
+    <linearGradient id="label" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5a68d6"/>
+      <stop offset="1" stop-color="#343a9e"/>
+    </linearGradient>
     <clipPath id="crystal"><path d="M48 2L75 22L95 52L97 84L84 117L58 148L32 133L11 106L3 72L19 35z"/></clipPath>
     <!-- The crystal's outline: lit along its upper left, dark below. -->
     <linearGradient id="rim" x1="0" y1="0" x2="1" y2="1">
@@ -29,6 +33,21 @@
   <path d="M50 12h96l58 58v152a14 14 0 0 1-14 14H50a14 14 0 0 1-14-14V26a14 14 0 0 1 14-14z"
         fill="url(#paper)" stroke="#aeb7c6" stroke-width="5" stroke-linejoin="round"/>
   <path d="M146 12v44a14 14 0 0 0 14 14h44z" fill="#dfe5ee" stroke="#aeb7c6" stroke-width="5" stroke-linejoin="round"/>
+
+  <!-- What is on the page: a title and a few lines of text. -->
+  <rect x="60" y="62" width="70" height="12" rx="6" fill="#bcc6da"/>
+  <rect x="60" y="94" width="120" height="8" rx="4" fill="#dce2ee"/>
+  <rect x="60" y="112" width="120" height="8" rx="4" fill="#dce2ee"/>
+  <rect x="60" y="130" width="84" height="8" rx="4" fill="#dce2ee"/>
+
+  <!-- The file type, on a label that overhangs the sheet's left edge. -->
+  <rect x="18" y="161" width="134" height="54" rx="12" fill="#1d2176" fill-opacity="0.28"/>
+  <rect x="18" y="156" width="134" height="54" rx="12" fill="url(#label)"/>
+  <g fill="none" stroke="#fff" stroke-width="7" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M44 196V170h10a8.5 8.5 0 0 1 0 17H44"/>
+    <path d="M76 170h7a13 13 0 0 1 0 26h-7z"/>
+    <path d="M112 196V170h17M112 184h13"/>
+  </g>
 
   <!-- The fragment: an egg-shaped cut crystal, lit from the upper left.
        Drawn in its own 100 x 150 box and placed over the sheet's corner. -->
