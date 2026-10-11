@@ -5,10 +5,12 @@
 //! document outline when a line matches a bookmark), paragraphs from line
 //! spacing, lists from their markers, emphasis from font style. Running
 //! headers and footers are recognised by repetition across pages and dropped.
-//! Tables and figures are not reconstructed.
+//! Tables are rebuilt where they are drawn with rules (see [`super::table`]);
+//! figures are not extracted.
 
 use std::collections::{HashMap, HashSet};
 
+use super::table::{self, Rule, Table};
 use super::text::{BOLD, ITALIC, MONO, PageText, Rect};
 use super::{OutlineItem, PageSize};
 
@@ -24,9 +26,19 @@ pub struct Span {
     pub style: u8,
 }
 
+/// A word and where it sits on its line, which is what table detection
+/// works from.
+#[derive(Debug, Clone)]
+pub struct Word {
+    pub x0: f32,
+    pub x1: f32,
+    pub spans: Vec<Span>,
+}
+
 #[derive(Debug, Clone)]
 pub struct TextLine {
     pub spans: Vec<Span>,
+    pub words: Vec<Word>,
     pub rect: Rect,
     pub size: f32,
 }
@@ -43,7 +55,7 @@ impl TextLine {
             .sum()
     }
 
-    fn all(&self, style: u8) -> bool {
+    pub(crate) fn all(&self, style: u8) -> bool {
         self.spans
             .iter()
             .filter(|span| !span.text.trim().is_empty())
@@ -54,16 +66,20 @@ impl TextLine {
 #[derive(Debug, Clone)]
 pub struct Page {
     pub lines: Vec<TextLine>,
+    /// Ruling lines drawn on the page.
+    pub rules: Vec<Rule>,
     pub height: f32,
 }
 
 impl Page {
     /// Builds the export model from a page extracted with styling.
-    pub fn new(text: &PageText, size: PageSize) -> Self {
+    pub fn new(text: &PageText, size: PageSize, rules: Vec<Rule>) -> Self {
         let mut lines = Vec::with_capacity(text.lines.len());
 
         for line in &text.lines {
             let mut spans: Vec<Span> = Vec::new();
+            let mut words: Vec<Word> = Vec::new();
+            let mut in_word = false;
             let mut sizes: HashMap<u32, usize> = HashMap::new();
             let mut style = 0;
 
@@ -76,6 +92,38 @@ impl Page {
                 if !glyph.rect.is_empty() {
                     style = glyph.style & STYLE_MASK;
                     *sizes.entry(size_key(glyph.size)).or_default() += 1;
+
+                    // A jump with no space glyph in it still ends a word.
+                    let jumps = words
+                        .last()
+                        .is_some_and(|word| glyph.rect.x0 - word.x1 > glyph.size.max(4.0));
+
+                    match words.last_mut() {
+                        Some(word) if in_word && !jumps => {
+                            word.x0 = word.x0.min(glyph.rect.x0);
+                            word.x1 = word.x1.max(glyph.rect.x1);
+
+                            match word.spans.last_mut() {
+                                Some(span) if span.style == style => span.text.push(glyph.ch),
+                                _ => word.spans.push(Span {
+                                    text: glyph.ch.to_string(),
+                                    style,
+                                }),
+                            }
+                        }
+                        _ => words.push(Word {
+                            x0: glyph.rect.x0,
+                            x1: glyph.rect.x1,
+                            spans: vec![Span {
+                                text: glyph.ch.to_string(),
+                                style,
+                            }],
+                        }),
+                    }
+
+                    in_word = true;
+                } else {
+                    in_word = false;
                 }
 
                 match spans.last_mut() {
@@ -97,6 +145,7 @@ impl Page {
             if !spans.is_empty() {
                 lines.push(TextLine {
                     spans,
+                    words,
                     rect: line.rect,
                     size: size as f32 / 2.0,
                 });
@@ -105,6 +154,7 @@ impl Page {
 
         Self {
             lines,
+            rules,
             height: size.height,
         }
     }
@@ -146,13 +196,45 @@ enum Block {
         spans: Vec<Span>,
     },
     Code(Vec<String>),
+    /// Rows of cells; the first row is the header.
+    Table(Vec<Vec<Vec<Span>>>),
 }
 
 pub fn render(pages: &[Page], outline: &[OutlineItem]) -> String {
     let furniture = find_furniture(pages);
+
+    let repeated = repeated_rules(pages);
+
+    let tables: Vec<Vec<Table>> = pages
+        .iter()
+        .enumerate()
+        .map(|(page_index, page)| {
+            let rules: Vec<Rule> = page
+                .rules
+                .iter()
+                .filter(|rule| !repeated.contains(&rule_key(rule)))
+                .copied()
+                .collect();
+
+            table::detect(&page.lines, &rules, &|line| {
+                furniture.contains(&(page_index, line))
+            })
+        })
+        .collect();
+
+    // Lines that are not running text: they neither set heading sizes nor
+    // flow into paragraphs.
+    let mut set_aside = furniture.clone();
+
+    for (page_index, tables) in tables.iter().enumerate() {
+        for table in tables {
+            set_aside.extend(table.lines.iter().map(|line| (page_index, *line)));
+        }
+    }
+
     let body = body_size(pages);
     let outline = OutlineIndex::new(outline);
-    let levels = Levels::new(pages, body, &furniture, &outline);
+    let levels = Levels::new(pages, body, &set_aside, &outline);
 
     let mut builder = Builder {
         minor_level: levels.minor(),
@@ -163,7 +245,15 @@ pub fn render(pages: &[Page], outline: &[OutlineItem]) -> String {
         builder.page_break();
 
         for (line_index, line) in page.lines.iter().enumerate() {
-            if furniture.contains(&(page_index, line_index)) {
+            // A table is emitted where its first line stood.
+            if let Some(table) = tables[page_index]
+                .iter()
+                .find(|table| table.lines.first() == Some(&line_index))
+            {
+                builder.table(table.rows.clone());
+            }
+
+            if set_aside.contains(&(page_index, line_index)) {
                 continue;
             }
 
@@ -343,6 +433,39 @@ fn body_size(pages: &[Page]) -> u32 {
         .max_by_key(|(size, count)| (*count, *size))
         .map(|(size, _)| size)
         .unwrap_or(24)
+}
+
+type RuleKey = (bool, i32, i32, i32);
+
+fn rule_key(rule: &Rule) -> RuleKey {
+    (
+        rule.horizontal,
+        rule.at.round() as i32,
+        rule.from.round() as i32,
+        rule.to.round() as i32,
+    )
+}
+
+/// Rules drawn in the same place on page after page are page furniture (a
+/// line under the running header, above the footer), not part of any table.
+fn repeated_rules(pages: &[Page]) -> HashSet<RuleKey> {
+    let mut counts: HashMap<RuleKey, usize> = HashMap::new();
+
+    for page in pages {
+        let keys: HashSet<RuleKey> = page.rules.iter().map(rule_key).collect();
+
+        for key in keys {
+            *counts.entry(key).or_default() += 1;
+        }
+    }
+
+    let needed = (pages.len() / 3).max(3);
+
+    counts
+        .into_iter()
+        .filter(|(_, count)| *count >= needed)
+        .map(|(key, _)| key)
+        .collect()
 }
 
 /// Finds running headers, footers and page numbers: lines in the top or
@@ -596,6 +719,15 @@ impl Builder {
         }
     }
 
+    fn table(&mut self, rows: Vec<Vec<Vec<Span>>>) {
+        self.close();
+        self.indents.clear();
+        self.blocks.push(Block::Table(rows));
+        // Whatever follows starts afresh rather than continuing a paragraph
+        // from above the table.
+        self.last = None;
+    }
+
     fn push(
         &mut self,
         line: &TextLine,
@@ -791,6 +923,26 @@ impl Builder {
                     out.push_str(&lines.join("\n"));
                     out.push_str("\n```");
                 }
+                Block::Table(rows) => {
+                    for (index, row) in rows.iter().enumerate() {
+                        if index > 0 {
+                            out.push('\n');
+                        }
+
+                        out.push('|');
+                        for cell in row {
+                            out.push(' ');
+                            // A pipe inside a cell would end it.
+                            out.push_str(&inline(cell, false).replace('|', "\\|"));
+                            out.push_str(" |");
+                        }
+
+                        if index == 0 {
+                            out.push_str("\n|");
+                            out.push_str(&" --- |".repeat(row.len()));
+                        }
+                    }
+                }
             }
 
             previous_was_item = is_item;
@@ -971,6 +1123,7 @@ mod tests {
                 text: text.into(),
                 style,
             }],
+            words: Vec::new(),
             rect: Rect {
                 x0: x,
                 y0: y,
@@ -984,6 +1137,7 @@ mod tests {
     fn page(lines: Vec<TextLine>) -> Page {
         Page {
             lines,
+            rules: Vec::new(),
             height: 800.0,
         }
     }
@@ -1081,6 +1235,7 @@ mod tests {
                     style: 0,
                 },
             ],
+            words: Vec::new(),
             rect: Rect {
                 x0: 72.0,
                 y0: 100.0,

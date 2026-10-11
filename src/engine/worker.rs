@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use pdfium_render::prelude::*;
 
+use super::table::Rule;
 use super::text::{self, Glyph, Rect};
 use super::{
     Bitmap, CopyRequest, DocInfo, Event, Job, JobKind, OutlineItem, PageSize, PageText, Shared,
@@ -520,12 +521,12 @@ impl<'p> Session<'_, 'p> {
                         width: 612.0,
                         height: 792.0,
                     });
-                    let text = self
+                    let (text, rules) = self
                         .page(page)
-                        .and_then(|page| extract(page, true))
+                        .map(|page| (extract(page, true).unwrap_or_default(), rules(page)))
                         .unwrap_or_default();
 
-                    pages.push(markdown::Page::new(&text, size));
+                    pages.push(markdown::Page::new(&text, size, rules));
 
                     (self.emit)(Event::Progress {
                         kind,
@@ -683,6 +684,193 @@ impl ViewMap {
     }
 }
 
+/// Paths with more segments than this are artwork, not ruling.
+const RULE_PATH_SEGMENTS: usize = 4_000;
+/// Upper bound on segments examined per page, so a page of dense vector art
+/// cannot stall an export.
+const RULE_PAGE_SEGMENTS: usize = 40_000;
+/// Anything at most this thick is a line, however it was painted.
+const RULE_THICKNESS: f32 = 3.0;
+const RULE_MIN_LENGTH: f32 = 6.0;
+
+/// Collects the straight horizontal and vertical lines drawn on a page, in
+/// view space. These are what tables are recognised by.
+fn rules(page: &PdfPage) -> Vec<Rule> {
+    let map = ViewMap::new(page);
+    let mut out = Vec::new();
+    let mut budget = RULE_PAGE_SEGMENTS;
+
+    collect_rules(page.objects().iter(), &[], &map, &mut budget, &mut out);
+    out
+}
+
+fn collect_rules<'a>(
+    objects: impl Iterator<Item = PdfPageObject<'a>>,
+    // Matrices of the enclosing form objects, innermost first.
+    forms: &[PdfMatrix],
+    map: &ViewMap,
+    budget: &mut usize,
+    out: &mut Vec<Rule>,
+) {
+    for object in objects {
+        if let Some(form) = object.as_x_object_form_object() {
+            if forms.len() < 4
+                && let Ok(matrix) = form.matrix()
+            {
+                let mut nested = vec![matrix];
+                nested.extend_from_slice(forms);
+                collect_rules(form.iter(), &nested, map, budget, out);
+            }
+            continue;
+        }
+
+        let Some(path) = object.as_path_object() else {
+            continue;
+        };
+
+        let segments = path.segments();
+        let count = segments.len() as usize;
+
+        if !(2..=RULE_PATH_SEGMENTS).contains(&count) || count > *budget {
+            continue;
+        }
+
+        *budget -= count;
+
+        let Ok(own) = path.matrix() else {
+            continue;
+        };
+
+        // Path coordinates are local: apply the path's matrix, then each
+        // enclosing form's, then the page's own transform.
+        let place = |x: PdfPoints, y: PdfPoints| {
+            let mut point = own.apply_to_points(x, y);
+
+            for form in forms {
+                point = form.apply_to_points(point.0, point.1);
+            }
+
+            map.point(point.0.value, point.1.value)
+        };
+
+        let mut edges: Vec<((f32, f32), (f32, f32))> = Vec::new();
+        let mut start = (0.0, 0.0);
+        let mut current = (0.0, 0.0);
+        let mut bounds = (
+            f32::INFINITY,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+        );
+        let mut curved = false;
+
+        for segment in segments.iter() {
+            let point = place(segment.x(), segment.y());
+
+            bounds = (
+                bounds.0.min(point.0),
+                bounds.1.min(point.1),
+                bounds.2.max(point.0),
+                bounds.3.max(point.1),
+            );
+
+            match segment.segment_type() {
+                PdfPathSegmentType::MoveTo => start = point,
+                PdfPathSegmentType::LineTo => edges.push((current, point)),
+                _ => curved = true,
+            }
+
+            current = point;
+
+            if segment.is_close() {
+                edges.push((current, start));
+                current = start;
+            }
+        }
+
+        let (width, height) = (bounds.2 - bounds.0, bounds.3 - bounds.1);
+
+        // A sliver, stroked or filled, is a single rule along its length.
+        if width.min(height) <= RULE_THICKNESS {
+            if !curved && width.max(height) >= RULE_MIN_LENGTH {
+                out.push(if width >= height {
+                    Rule {
+                        horizontal: true,
+                        at: (bounds.1 + bounds.3) * 0.5,
+                        from: bounds.0,
+                        to: bounds.2,
+                    }
+                } else {
+                    Rule {
+                        horizontal: false,
+                        at: (bounds.0 + bounds.2) * 0.5,
+                        from: bounds.1,
+                        to: bounds.3,
+                    }
+                });
+            }
+            continue;
+        }
+
+        // Otherwise only outlines count: the edges of a stroked box or of a
+        // whole grid drawn as one path. A filled area is a background.
+        if !path.is_stroked().unwrap_or(false) {
+            continue;
+        }
+
+        let straight: Vec<Rule> = edges
+            .iter()
+            .filter_map(|(a, b)| {
+                let (dx, dy) = ((b.0 - a.0).abs(), (b.1 - a.1).abs());
+
+                if dy <= 0.7 && dx >= RULE_MIN_LENGTH {
+                    Some(Rule {
+                        horizontal: true,
+                        at: (a.1 + b.1) * 0.5,
+                        from: a.0.min(b.0),
+                        to: a.0.max(b.0),
+                    })
+                } else if dx <= 0.7 && dy >= RULE_MIN_LENGTH {
+                    Some(Rule {
+                        horizontal: false,
+                        at: (a.0 + b.0) * 0.5,
+                        from: a.1.min(b.1),
+                        to: a.1.max(b.1),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // A box with rounded corners: its four sides stop short of one
+        // another, so give the frame its full extent or they would read as
+        // unrelated rules.
+        let sides = edges
+            .iter()
+            .filter(|(a, b)| (b.0 - a.0).abs().max((b.1 - a.1).abs()) > 0.5)
+            .count();
+
+        if curved && straight.len() == 4 && sides == 4 {
+            for (horizontal, at) in [
+                (true, bounds.1),
+                (true, bounds.3),
+                (false, bounds.0),
+                (false, bounds.2),
+            ] {
+                out.push(Rule {
+                    horizontal,
+                    at,
+                    from: if horizontal { bounds.0 } else { bounds.1 },
+                    to: if horizontal { bounds.2 } else { bounds.3 },
+                });
+            }
+        } else {
+            out.extend(straight);
+        }
+    }
+}
+
 /// Reads the text layer. `styled` additionally resolves font size and style
 /// per glyph, which costs extra library calls and is only needed for export.
 fn extract(page: &PdfPage, styled: bool) -> Option<PageText> {
@@ -728,7 +916,7 @@ fn extract(page: &PdfPage, styled: bool) -> Option<PageText> {
                 glyph.size = char.scaled_font_size().value;
                 font = fonts.intern(&char);
                 glyph.style = fonts.entries[font].style;
-                fonts.entries[font].observe(rect.width() / glyph.size.max(0.1));
+                fonts.entries[font].observe(ch, rect.width() / glyph.size.max(0.1));
 
                 if map.is_rotated(char.angle_radians().unwrap_or(0.0)) {
                     glyph.style |= markdown::ROTATED;
@@ -760,25 +948,52 @@ struct Fonts {
 struct Font {
     name: String,
     style: u8,
-    glyphs: u32,
-    narrowest: f32,
-    widest: f32,
+    /// Advance of each glyph seen, in ems.
+    advances: Vec<f32>,
+    /// Whether letters that differ in width in any proportional design have
+    /// both been seen: without them, equal advances prove nothing (digits
+    /// alone are the same width in most fonts).
+    saw_narrow: bool,
+    saw_wide: bool,
 }
 
 impl Font {
-    fn observe(&mut self, advance: f32) {
+    fn observe(&mut self, ch: char, advance: f32) {
         if advance > 0.05 {
-            self.glyphs += 1;
-            self.narrowest = self.narrowest.min(advance);
-            self.widest = self.widest.max(advance);
+            self.advances.push(advance);
+            self.saw_narrow |= matches!(
+                ch,
+                'i' | 'l' | 'I' | 'j' | 't' | 'f' | '.' | ',' | ':' | ';' | '\'' | '!' | '|'
+            );
+            self.saw_wide |= matches!(
+                ch,
+                'm' | 'w' | 'M' | 'W' | '@' | 'G' | 'O' | 'D' | 'H' | 'N'
+            );
         }
     }
 
     /// Many embedded fonts do not declare themselves fixed pitch; uniform
-    /// advances give them away.
+    /// advances give them away. Nearly uniform is enough: a fixed-pitch
+    /// font may still carry the odd wide glyph.
     fn is_monospaced(&self) -> bool {
-        self.style & text::MONO != 0
-            || (self.glyphs >= 12 && self.widest - self.narrowest < self.widest * 0.03)
+        if self.style & text::MONO != 0 {
+            return true;
+        }
+
+        if self.advances.len() < 12 || !self.saw_narrow || !self.saw_wide {
+            return false;
+        }
+
+        let mut sorted = self.advances.clone();
+        sorted.sort_by(f32::total_cmp);
+
+        let median = sorted[sorted.len() / 2];
+        let typical = sorted
+            .iter()
+            .filter(|advance| (**advance - median).abs() <= median * 0.03)
+            .count();
+
+        typical * 100 >= sorted.len() * 96
     }
 }
 
@@ -793,9 +1008,9 @@ impl Fonts {
         self.entries.push(Font {
             style: style_of(char, &name.to_ascii_lowercase()),
             name,
-            glyphs: 0,
-            narrowest: f32::INFINITY,
-            widest: 0.0,
+            advances: Vec::new(),
+            saw_narrow: false,
+            saw_wide: false,
         });
 
         self.entries.len() - 1

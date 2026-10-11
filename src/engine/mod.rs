@@ -9,6 +9,7 @@
 
 pub mod markdown;
 pub mod print;
+pub mod table;
 pub mod text;
 mod worker;
 
@@ -332,7 +333,7 @@ pub(crate) mod tests {
         let doc = &fixture.doc;
 
         assert_eq!(doc.title, "Sample Document");
-        assert_eq!(doc.pages.len(), 2);
+        assert_eq!(doc.pages.len(), 3);
         assert_eq!(
             doc.pages[0],
             PageSize {
@@ -511,7 +512,16 @@ pub(crate) mod tests {
              - first item\n- second item\n\n\
              ```\nlet answer = 42;\n```\n\n\
              ## Results\n\n\
-             The second page holds the closing remarks of the document.\n"
+             The second page holds the closing remarks of the document.\n\n\
+             Table 1: Scores by model.\n\n\
+             | Model | Score | Cost |\n\
+             | --- | --- | --- |\n\
+             | Small | 27.3 | 3.3 |\n\
+             | Big net | 28.4 | 2.3 |\n\n\
+             | Option | Description |\n\
+             | --- | --- |\n\
+             | `-p` | Show the patch introduced with each commit. |\n\
+             | `--stat` | Show statistics. |\n"
         );
     }
 

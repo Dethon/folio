@@ -17,8 +17,8 @@ Chrome); the interface is [Iced](https://iced.rs) on the GPU.
   onto the printer by PDFium directly, so text and vector art stay vector.
 - **Markdown export.** Headings (from font size and the document outline),
   paragraphs with hyphenation undone, nested lists, bold / italic / inline
-  code, fenced code blocks; running headers, footers and page numbers are
-  dropped. Also available without the window:
+  code, fenced code blocks, and tables; running headers, footers and page
+  numbers are dropped. Also available without the window:
   `folio --export-markdown in.pdf out.md`.
 
 `folio --help` lists the command-line options.
@@ -128,6 +128,7 @@ src/
     worker.rs        the PDFium thread: rendering, text extraction, jobs
     text.rs          text layer, hit testing, selection ranges
     markdown.rs      structure inference and Markdown output
+    table.rs         table detection from ruling lines
     print.rs         Windows print dialog and device rendering
   ui/
     viewer.rs        page view: layout, scrolling, zoom, tile cache, selection
@@ -142,7 +143,11 @@ examples/make-icon.rs  renders the icon artwork to .ico / .png / .bmp
 
 - Search, clickable links, and password-protected documents.
 - Annotations and form filling (annotations are displayed, not editable).
-- Markdown export does not reconstruct tables or extract images.
+- Markdown export only recognises tables that are drawn: a grid, or the
+  horizontal rules of a typeset table. Tables laid out by spacing alone stay
+  as text, since they cannot be told from columns of prose. Merged cells are
+  flattened (Markdown has none), a table continuing onto the next page
+  becomes two tables, and images are not extracted.
 - Printing outside Windows hands the whole file to `lp`.
 - `folio.exe` itself carries no icon resource (that needs a resource compiler
   the cross-build does not have), so the bare file shows a generic icon in

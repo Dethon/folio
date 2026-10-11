@@ -4,7 +4,7 @@
 << /Type /Catalog /Pages 2 0 R /Outlines 10 0 R /PageMode /UseOutlines >>
 endobj
 2 0 obj
-<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>
+<< /Type /Pages /Kids [3 0 R 4 0 R 14 0 R] /Count 3 >>
 endobj
 3 0 obj
 << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R /Resources << /Font << /F1 7 0 R /F2 8 0 R /F3 9 0 R >> >> >>
@@ -58,24 +58,71 @@ endobj
 13 0 obj
 << /Title (Sample Document) >>
 endobj
+14 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 15 0 R /Resources << /Font << /F1 7 0 R /F2 8 0 R /F3 9 0 R >> /XObject << /Fm1 16 0 R >> >> >>
+endobj
+15 0 obj
+<< /Length 894 >>
+stream
+BT
+/F1 11 Tf 1 0 0 1 72 715 Tm (Table 1: Scores by model.) Tj
+/F1 11 Tf 1 0 0 1 76 687 Tm (Model) Tj
+/F1 11 Tf 1 0 0 1 200 687 Tm (Score) Tj
+/F1 11 Tf 1 0 0 1 290 687 Tm (Cost) Tj
+/F1 11 Tf 1 0 0 1 76 667 Tm (Small) Tj
+/F1 11 Tf 1 0 0 1 200 667 Tm (27.3) Tj
+/F1 11 Tf 1 0 0 1 290 667 Tm (3.3) Tj
+/F1 11 Tf 1 0 0 1 76 652 Tm (Big net) Tj
+/F1 11 Tf 1 0 0 1 200 652 Tm (28.4) Tj
+/F1 11 Tf 1 0 0 1 290 652 Tm (2.3) Tj
+/F1 11 Tf 1 0 0 1 77 586 Tm (Option) Tj
+/F1 11 Tf 1 0 0 1 177 586 Tm (Description) Tj
+/F3 11 Tf 1 0 0 1 77 566 Tm (-p) Tj
+/F1 11 Tf 1 0 0 1 177 566 Tm (Show the patch introduced) Tj
+/F1 11 Tf 1 0 0 1 177 553 Tm (with each commit.) Tj
+/F3 11 Tf 1 0 0 1 77 534 Tm (--stat) Tj
+/F1 11 Tf 1 0 0 1 177 534 Tm (Show statistics.) Tj
+ET
+0.5 w
+72 580 100 20 re S
+172 580 228 20 re S
+72 548 100 32 re S
+172 548 228 32 re S
+72 528 100 20 re S
+172 528 228 20 re S
+q 1 0 0 1 30 -40 cm /Fm1 Do Q
+endstream
+endobj
+16 0 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 612 792] /Length 68 >>
+stream
+0.8 w
+42 740 m 330 740 l S
+42 722 m 330 722 l S
+42 680 m 330 680 l S
+endstream
+endobj
 xref
-0 14
+0 17
 0000000000 65535 f 
 0000000015 00000 n 
 0000000104 00000 n 
-0000000167 00000 n 
-0000000313 00000 n 
-0000000459 00000 n 
-0000001106 00000 n 
-0000001295 00000 n 
-0000001392 00000 n 
-0000001494 00000 n 
-0000001589 00000 n 
-0000001663 00000 n 
-0000001763 00000 n 
-0000001858 00000 n 
+0000000174 00000 n 
+0000000320 00000 n 
+0000000466 00000 n 
+0000001113 00000 n 
+0000001302 00000 n 
+0000001399 00000 n 
+0000001501 00000 n 
+0000001596 00000 n 
+0000001670 00000 n 
+0000001770 00000 n 
+0000001865 00000 n 
+0000001912 00000 n 
+0000002087 00000 n 
+0000003033 00000 n 
 trailer
-<< /Size 14 /Root 1 0 R /Info 13 0 R >>
+<< /Size 17 /Root 1 0 R /Info 13 0 R >>
 startxref
-1905
+3202
 %%EOF
