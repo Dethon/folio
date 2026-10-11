@@ -48,7 +48,7 @@ There is also a portable folder, `folio-windows-x64`, that runs from anywhere.
 | Print | Ctrl+P |
 | Export as Markdown | Ctrl+E |
 | Find | Ctrl+F |
-| Next / previous match | Enter / Shift+Enter, or F3 / Shift+F3 |
+| Next / previous match | Enter / Shift+Enter, F3 / Shift+F3, or Ctrl+G / Ctrl+Shift+G |
 | Close the find bar | Esc |
 | Copy / Select all / Clear selection | Ctrl+C / Ctrl+A / Esc |
 | Zoom in / out / actual size | Ctrl++ / Ctrl+− / Ctrl+0, or Ctrl+wheel |
