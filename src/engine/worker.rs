@@ -1047,8 +1047,12 @@ fn extract(page: &PdfPage, styled: bool) -> Option<PageText> {
         glyphs.push(glyph);
     }
 
+    // Judged once per font, not once per glyph: it sorts every advance the
+    // font was seen at.
+    let monospaced: Vec<bool> = fonts.entries.iter().map(Font::is_monospaced).collect();
+
     for (glyph, font) in glyphs.iter_mut().zip(&glyph_fonts) {
-        if fonts.entries.get(*font).is_some_and(Font::is_monospaced) {
+        if monospaced.get(*font).copied().unwrap_or(false) {
             glyph.style |= text::MONO;
         }
     }
