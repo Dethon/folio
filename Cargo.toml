@@ -12,6 +12,7 @@ iced = { version = "0.14", features = ["image", "svg", "advanced", "tokio"] }
 pdfium-render = { version = "0.9.4", default-features = false, features = ["pdfium_latest", "thread_safe"] }
 rfd = "0.17"
 lru = "0.18"
+log = "0.4"
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 [target.'cfg(windows)'.dependencies]
@@ -22,6 +23,10 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_Gdi",
     "Win32_Storage_Xps",
     "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_ProcessStatus",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
     "Win32_UI_Controls_Dialogs",
 ] }
 

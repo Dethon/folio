@@ -26,6 +26,7 @@ use crate::engine::text::{self, Rect};
 use crate::engine::{
     Anchor, Bitmap, DocInfo, Granularity, Match, PageSize, PageText, TILE, TileKey, page_pixels,
 };
+use crate::trace;
 use crate::ui::theme::Palette;
 
 /// Space around the page stack, in logical pixels.
@@ -78,6 +79,8 @@ struct Selection {
 /// What the engine should produce next, most urgent first.
 #[derive(Debug, Default, PartialEq)]
 pub struct Wanted {
+    /// How many of `tiles`, from the front, are in view right now.
+    pub visible: usize,
     pub tiles: Vec<TileKey>,
     pub texts: Vec<u32>,
     pub thumbnails: Vec<u32>,
@@ -589,6 +592,7 @@ impl Viewer {
 
         tiles.sort_by(|a, b| a.0.total_cmp(&b.0));
         wanted.tiles.extend(tiles.drain(..).map(|(_, key)| key));
+        wanted.visible = wanted.tiles.len();
 
         let visible = self.visible_pages();
 
@@ -1074,6 +1078,8 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for View<'_, Message>
 
         match event {
             Event::Window(window::Event::RedrawRequested(_)) => {
+                trace::mark("first redraw of the page view");
+
                 if state.size != bounds.size() {
                     state.size = bounds.size();
                     publish(Interaction::Resized(bounds.size()));

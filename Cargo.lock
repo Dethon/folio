@@ -1115,6 +1115,7 @@ dependencies = [
  "iced_test",
  "image",
  "libloading 0.8.9",
+ "log",
  "lru 0.18.5",
  "memmap2",
  "pdfium-render",

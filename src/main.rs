@@ -3,6 +3,7 @@
 
 mod app;
 mod engine;
+mod trace;
 mod ui;
 
 use std::path::PathBuf;
@@ -27,6 +28,8 @@ Options:
 ";
 
 fn main() -> iced::Result {
+    trace::init();
+
     let mut options = app::Options::default();
     let mut args = std::env::args().skip(1);
 
@@ -58,10 +61,14 @@ fn main() -> iced::Result {
             "--sidebar" => options.sidebar = args.next(),
             "--print" => options.print = true,
             // Undocumented development aids: start with everything selected;
-            // start with a search made; render one frame to a PNG and exit.
+            // start with a search made; render one frame to a PNG and exit;
+            // scroll through the document for a number of frames and exit.
             "--select-all" => options.select_all = true,
             "--find" => options.find = args.next(),
             "--screenshot" => options.screenshot = args.next().map(PathBuf::from),
+            "--scroll-test" => {
+                options.scroll_test = args.next().and_then(|value| value.parse().ok());
+            }
             _ => options.file = Some(PathBuf::from(arg)),
         }
     }

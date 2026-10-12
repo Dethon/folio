@@ -13,6 +13,7 @@ use iced::window;
 use iced::{Element, Size, Subscription, Task};
 
 use crate::engine::{self, DocInfo, Engine, JobKind, print};
+use crate::trace;
 use crate::ui::theme::Palette;
 use crate::ui::viewer::{Fit, Interaction, Viewer};
 use crate::ui::{self, sidebar};
@@ -35,6 +36,9 @@ pub struct Options {
     pub print: bool,
     /// Development aid: start with the find bar open on this query.
     pub find: Option<String>,
+    /// Development aid: once the first view has rendered, scroll down for
+    /// this many frames, report how they went to the trace, and quit.
+    pub scroll_test: Option<u32>,
 }
 
 /// Carries a value that cannot be cloned through a message, which must be.
@@ -94,6 +98,8 @@ pub enum Message {
     Window(window::Event),
     ScaleFactor(f32),
     Tick(Instant),
+    /// A frame of the scroll test.
+    Frame(Instant),
     DismissToast,
     Screenshot(Once<window::Screenshot>),
 }
@@ -143,6 +149,21 @@ pub struct App {
     options: Options,
     /// Frames to wait before taking the requested screenshot.
     screenshot_countdown: Option<u8>,
+    scroll_test: Option<ScrollTest>,
+}
+
+/// Distance the scroll test moves per frame, in logical pixels.
+const SCROLL_TEST_STEP: f32 = 30.0;
+
+/// A scroll test in progress.
+struct ScrollTest {
+    last: Instant,
+    /// Milliseconds between frames.
+    intervals: Vec<f32>,
+    /// Whether tiles in view are missing right now.
+    missing: bool,
+    /// Frames drawn while they were.
+    incomplete: u32,
 }
 
 impl App {
@@ -168,7 +189,10 @@ impl App {
             modifiers: keyboard::Modifiers::default(),
             options,
             screenshot_countdown: None,
+            scroll_test: None,
         };
+
+        trace::mark("boot");
 
         if let Some(path) = app.options.file.clone() {
             app.open(path);
@@ -206,10 +230,15 @@ impl App {
             subscriptions.push(iced::time::every(Duration::from_millis(200)).map(Message::Tick));
         }
 
+        if self.scroll_test.is_some() {
+            subscriptions.push(window::frames().map(Message::Frame));
+        }
+
         Subscription::batch(subscriptions)
     }
 
     pub fn view(&self) -> Element<'_, Message> {
+        trace::mark("first view");
         ui::view(self)
     }
 
@@ -249,16 +278,37 @@ impl App {
     fn sync(&mut self) {
         let wanted = self.viewer.wanted(self.sidebar_thumbnails());
 
-        if self.screenshot_countdown.is_none()
-            && self.options.screenshot.is_some()
-            && self.opening.is_none()
+        if self.document().is_some() && self.viewer.has_viewport() && wanted.visible == 0 {
+            trace::mark("view complete");
+        }
+
+        if let Some(test) = self.scroll_test.as_mut() {
+            test.missing = wanted.visible > 0;
+        }
+
+        let settled = self.opening.is_none()
             && !self.find.searching
             && self.viewer.has_viewport()
             && wanted.tiles.is_empty()
             && wanted.texts.is_empty()
-            && wanted.thumbnails.is_empty()
-        {
+            && wanted.thumbnails.is_empty();
+
+        if settled && self.screenshot_countdown.is_none() && self.options.screenshot.is_some() {
             self.screenshot_countdown = Some(2);
+        }
+
+        if settled
+            && self.document().is_some()
+            && self.scroll_test.is_none()
+            && self.options.scroll_test.is_some()
+        {
+            trace::memory("before scrolling");
+            self.scroll_test = Some(ScrollTest {
+                last: Instant::now(),
+                intervals: Vec::new(),
+                missing: false,
+                incomplete: 0,
+            });
         }
 
         self.engine
@@ -344,7 +394,11 @@ impl App {
                 }
             }
             Message::Viewer(interaction) => match interaction {
-                Interaction::Resized(size) => self.viewer.set_viewport(size),
+                Interaction::Resized(size) => {
+                    // Published while the first frame was being drawn.
+                    trace::mark("first frame drawn");
+                    self.viewer.set_viewport(size);
+                }
                 Interaction::Scrolled { dx, dy } => self.viewer.scroll_by(dx, dy),
                 Interaction::Zoomed { factor, at } => self.viewer.zoom_by(factor, Some(at)),
                 Interaction::Pressed {
@@ -542,6 +596,7 @@ impl App {
                 match self.screenshot_countdown {
                     Some(0) => {
                         self.screenshot_countdown = Some(u8::MAX);
+                        trace::memory("settled");
 
                         return window::oldest()
                             .and_then(window::screenshot)
@@ -552,6 +607,7 @@ impl App {
                     None => {}
                 }
             }
+            Message::Frame(now) => return self.scroll_test_frame(now),
             Message::DismissToast => self.toast = None,
             Message::Screenshot(shot) => {
                 if let (Some(shot), Some(path)) = (shot.take(), self.options.screenshot.clone()) {
@@ -580,6 +636,7 @@ impl App {
 
         match event {
             engine::Event::Opened(doc) => {
+                trace::mark("opened received");
                 self.opening = None;
                 self.sidebar.set_document(&doc);
                 self.viewer.set_document(doc);
@@ -634,6 +691,7 @@ impl App {
                 self.notify(format!("Could not open {name}. {error}"), Tone::Error);
             }
             engine::Event::Tile { doc, key, bitmap } if Some(doc) == current => {
+                trace::mark("first tile received");
                 self.viewer.insert_tile(key, bitmap);
             }
             engine::Event::Thumbnail { doc, page, bitmap } if Some(doc) == current => {
@@ -702,6 +760,49 @@ impl App {
         }
 
         Task::none()
+    }
+
+    /// Advances the scroll test by a frame; at its end, reports and quits.
+    fn scroll_test_frame(&mut self, now: Instant) -> Task<Message> {
+        let frames = self.options.scroll_test.unwrap_or(0) as usize;
+
+        let Some(test) = self.scroll_test.as_mut() else {
+            return Task::none();
+        };
+
+        test.intervals
+            .push(now.duration_since(test.last).as_secs_f32() * 1000.0);
+        test.last = now;
+        test.incomplete += test.missing as u32;
+
+        if test.intervals.len() <= frames {
+            self.viewer.scroll_by(0.0, SCROLL_TEST_STEP);
+            return Task::none();
+        }
+
+        // The first interval runs from the end of loading, not from a frame.
+        let mut intervals = test.intervals.split_off(1);
+        let incomplete = test.incomplete;
+
+        intervals.sort_by(f32::total_cmp);
+
+        let at =
+            |quantile: f32| intervals[((intervals.len() - 1) as f32 * quantile).round() as usize];
+
+        trace::note(|| {
+            format!(
+                "scroll test: {} frames, interval p50 {:.2} ms, p95 {:.2} ms, p99 {:.2} ms, \
+                 max {:.2} ms; {incomplete} frames with tiles in view missing",
+                intervals.len(),
+                at(0.5),
+                at(0.95),
+                at(0.99),
+                at(1.0),
+            )
+        });
+        trace::memory("after scrolling");
+
+        iced::exit()
     }
 
     fn key_pressed(&mut self, key: Key, modifiers: keyboard::Modifiers) -> Task<Message> {

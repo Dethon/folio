@@ -5,6 +5,8 @@ use std::time::{Duration, Instant};
 
 use pdfium_render::prelude::*;
 
+use crate::trace;
+
 use super::table::Rule;
 use super::text::{self, Glyph, Rect};
 use super::{
@@ -27,6 +29,8 @@ const OUTLINE_LIMIT: usize = 20_000;
 pub(crate) fn run(shared: Arc<Shared>, emit: Emit) {
     let pdfium = pdfium();
     let mut next_id = 1u64;
+
+    trace::mark("engine: pdfium bound");
 
     loop {
         let Some(path) = next_open(&shared) else {
@@ -57,6 +61,8 @@ pub(crate) fn run(shared: Arc<Shared>, emit: Emit) {
 
         let info = Arc::new(describe(&document, next_id, &path));
         next_id += 1;
+
+        trace::mark("engine: document described");
 
         emit(Event::Opened(info.clone()));
 
@@ -423,6 +429,7 @@ impl<'p> Session<'_, 'p> {
         };
 
         if let Some(bitmap) = render(page, region) {
+            trace::mark("engine: first tile rendered");
             self.recent.push_back((key, Instant::now()));
 
             (self.emit)(Event::Tile {
