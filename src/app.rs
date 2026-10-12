@@ -404,6 +404,7 @@ impl App {
         self.find.id += 1;
         self.find.searching = !self.find.query.trim().is_empty();
         self.find.capped = false;
+        trace::note(|| format!("search for {:?}", self.find.query));
         self.engine
             .search(self.find.id, self.find.query.clone(), from);
     }
@@ -764,6 +765,7 @@ impl App {
                 search,
                 capped,
             } if Some(doc) == current && search == self.find.id => {
+                trace::note(|| format!("search done: {} matches", self.viewer.match_count()));
                 self.find.searching = false;
                 self.find.capped = capped;
                 self.viewer.finish_search();

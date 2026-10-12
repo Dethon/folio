@@ -164,6 +164,8 @@ fn export(input: PathBuf, output: PathBuf) -> i32 {
         match event {
             Event::Opened(_) => engine.export_markdown(output.clone()),
             Event::Exported(path) => {
+                trace::mark("exported");
+                trace::memory("exported");
                 println!("{}", path.display());
                 return 0;
             }

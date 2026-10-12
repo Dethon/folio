@@ -105,7 +105,8 @@ pub fn mark(label: &'static str) {
 /// Records a free-form line.
 pub fn note(line: impl FnOnce() -> String) {
     with(|state| {
-        let _ = writeln!(state.file, "          {}", line());
+        let at = state.before_main + state.start.elapsed().as_secs_f64() * 1000.0;
+        let _ = writeln!(state.file, "{at:9.1} {}", line());
     });
 }
 
