@@ -7,13 +7,17 @@ pub mod viewer;
 
 use std::time::Duration;
 
+use iced::advanced::layout::{self, Layout};
+use iced::advanced::renderer;
+use iced::advanced::widget::{Tree, Widget};
 use iced::widget::{
     button, column, container, mouse_area, progress_bar, row, space, stack, text, text_input,
     tooltip,
 };
-use iced::{Center, Element, Fill, Font, Padding, Size, border, font, mouse};
+use iced::{Center, Element, Fill, Font, Length, Padding, Rectangle, Size, border, font, mouse};
 
 use crate::app::{App, Find, Message, Tone};
+use crate::graphics;
 use icon::Icon;
 use theme::Palette;
 use viewer::Fit;
@@ -127,10 +131,44 @@ pub fn view(app: &App) -> Element<'_, Message> {
     column![toolbar(app), horizontal_rule(palette), body].into()
 }
 
+/// The rule under the toolbar. It is in every frame, whatever else is
+/// showing, which makes it the place to mark the start of one.
 fn horizontal_rule<'a>(palette: Palette) -> Element<'a, Message> {
-    container(space().width(Fill).height(1))
+    container(Element::new(FrameMark))
         .style(move |_| theme::rule(palette))
         .into()
+}
+
+/// A pixel-high strip that draws nothing, and tells the graphics module that
+/// a frame is being drawn.
+struct FrameMark;
+
+impl<Message> Widget<Message, iced::Theme, iced::Renderer> for FrameMark {
+    fn size(&self) -> Size<Length> {
+        Size::new(Fill, Length::Fixed(1.0))
+    }
+
+    fn layout(
+        &mut self,
+        _tree: &mut Tree,
+        _renderer: &iced::Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        layout::atomic(limits, Fill, 1)
+    }
+
+    fn draw(
+        &self,
+        _tree: &Tree,
+        _renderer: &mut iced::Renderer,
+        _theme: &iced::Theme,
+        _style: &renderer::Style,
+        _layout: Layout<'_>,
+        _cursor: mouse::Cursor,
+        _viewport: &Rectangle,
+    ) {
+        graphics::pace();
+    }
 }
 
 fn vertical_rule<'a>(palette: Palette) -> Element<'a, Message> {

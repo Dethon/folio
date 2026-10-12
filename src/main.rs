@@ -4,6 +4,7 @@
 mod app;
 mod bench;
 mod engine;
+mod graphics;
 mod trace;
 mod ui;
 
@@ -81,7 +82,7 @@ fn main() -> iced::Result {
 
     options.scale_factor = display_scale_factor();
 
-    select_graphics_backend();
+    graphics::select();
     discover_fonts();
 
     app::run(options)
@@ -123,17 +124,6 @@ fn attach_console() {
                 let _ = AttachConsole(ATTACH_PARENT_PROCESS);
             }
         }
-    }
-}
-
-/// Windows always has Direct3D 12. Naming it stops the renderer from also
-/// loading the Vulkan and OpenGL drivers just to compare adapters, which
-/// costs start-up time and tens of megabytes. `WGPU_BACKEND` still overrides.
-fn select_graphics_backend() {
-    if cfg!(windows) && std::env::var_os("WGPU_BACKEND").is_none() {
-        // SAFETY: nothing else is running yet, so no thread can be reading
-        // the environment.
-        unsafe { std::env::set_var("WGPU_BACKEND", "dx12") };
     }
 }
 
