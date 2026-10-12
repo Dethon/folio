@@ -123,20 +123,31 @@ pub fn usage_line(label: &str) -> String {
     let mib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
 
     format!(
-        "memory[{label}]: working set {:.1} MiB, peak {:.1} MiB, private {:.1} MiB, {} threads",
+        "memory[{label}]: working set {:.1} MiB ({:.1} private), peak {:.1} MiB, committed {:.1} MiB, \
+         {} threads, {:.0} ms of processor time so far ({:.0} on this thread)",
         mib(usage.working_set),
+        mib(usage.private_working_set),
         mib(usage.peak_working_set),
         mib(usage.private),
         usage.threads,
+        usage.processor,
+        usage.this_thread,
     )
 }
 
 #[derive(Default)]
 struct Usage {
     working_set: u64,
+    /// The part of the working set no other process shares: the figure Task
+    /// Manager shows as "Memory".
+    private_working_set: u64,
     peak_working_set: u64,
     private: u64,
     threads: u32,
+    /// Milliseconds of processor time used, on every thread.
+    processor: f64,
+    /// And on the thread asking, where that can be told.
+    this_thread: f64,
 }
 
 #[cfg(windows)]
@@ -146,7 +157,7 @@ mod platform {
         CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
     };
     use windows::Win32::System::ProcessStatus::{
-        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX2,
     };
     use windows::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
     use windows::Win32::System::Threading::{
@@ -174,19 +185,39 @@ mod platform {
 
     pub fn usage() -> Usage {
         let mut usage = Usage::default();
-        let mut counters = PROCESS_MEMORY_COUNTERS_EX::default();
+        let mut counters = PROCESS_MEMORY_COUNTERS_EX2::default();
 
         unsafe {
             let read = K32GetProcessMemoryInfo(
                 GetCurrentProcess(),
                 (&raw mut counters).cast::<PROCESS_MEMORY_COUNTERS>(),
-                size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
+                size_of::<PROCESS_MEMORY_COUNTERS_EX2>() as u32,
             );
+
+            let mut times = [FILETIME::default(); 4];
+            let [created, exited, kernel, user] = &mut times;
+
+            if GetProcessTimes(GetCurrentProcess(), created, exited, kernel, user).is_ok() {
+                usage.processor = (ticks(*kernel) + ticks(*user)) as f64 / 10_000.0;
+            }
+
+            if windows::Win32::System::Threading::GetThreadTimes(
+                windows::Win32::System::Threading::GetCurrentThread(),
+                created,
+                exited,
+                kernel,
+                user,
+            )
+            .is_ok()
+            {
+                usage.this_thread = (ticks(*kernel) + ticks(*user)) as f64 / 10_000.0;
+            }
 
             if read.as_bool() {
                 usage.working_set = counters.WorkingSetSize as u64;
                 usage.peak_working_set = counters.PeakWorkingSetSize as u64;
                 usage.private = counters.PrivateUsage as u64;
+                usage.private_working_set = counters.PrivateWorkingSetSize as u64;
             }
 
             if let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) {
@@ -226,6 +257,23 @@ mod platform {
         let mut usage = Usage::default();
         let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
 
+        // Fields 14 and 15 of `stat`, after the name in brackets, are the
+        // time spent in user and kernel mode, in ticks of 10 ms.
+        if let Some(fields) = std::fs::read_to_string("/proc/self/stat")
+            .ok()
+            .as_deref()
+            .and_then(|stat| stat.rsplit_once(')'))
+        {
+            usage.processor = fields
+                .1
+                .split_whitespace()
+                .skip(11)
+                .take(2)
+                .filter_map(|ticks| ticks.parse::<f64>().ok())
+                .sum::<f64>()
+                * 10.0;
+        }
+
         for line in status.lines() {
             let Some((key, value)) = line.split_once(':') else {
                 continue;
@@ -240,7 +288,10 @@ mod platform {
             match key {
                 "VmRSS" => usage.working_set = number * 1024,
                 "VmHWM" => usage.peak_working_set = number * 1024,
-                "RssAnon" => usage.private = number * 1024,
+                "RssAnon" => {
+                    usage.private = number * 1024;
+                    usage.private_working_set = number * 1024;
+                }
                 "Threads" => usage.threads = number as u32,
                 _ => {}
             }
