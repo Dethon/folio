@@ -21,9 +21,12 @@ pub use text::{Anchor, Granularity, PageText, Rect};
 
 /// Edge length of a render tile in device pixels.
 ///
-/// 512² RGBA is 1 MiB, which keeps every tile under the renderer's threshold
-/// for synchronous texture uploads so tiles appear the frame they arrive.
-pub const TILE: u32 = 512;
+/// The renderer packs images into 2048² textures with a pixel of padding all
+/// round, so sixteen tiles of 510 fill one exactly; at 512, only nine would
+/// fit. A tile is also just under 1 MiB of RGBA, well below the renderer's
+/// threshold for synchronous texture uploads, so tiles appear the frame
+/// they arrive.
+pub const TILE: u32 = 510;
 
 /// Width in device pixels of page thumbnails.
 pub const THUMBNAIL_WIDTH: u32 = 200;

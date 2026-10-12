@@ -44,10 +44,16 @@ const ZOOM_STEPS: [f32; 17] = [
     0.1, 0.25, 0.33, 0.5, 0.67, 0.75, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 3.0, 4.0, 6.0, 8.0,
 ];
 
-/// Memory budget for rendered tiles.
-const TILE_BUDGET: usize = 256 * 1024 * 1024;
+/// Rendered tiles are kept for this many screenfuls of page. A view and what
+/// is prefetched around it come to two and a half; the rest is what can be
+/// scrolled back to without rendering it again.
+const TILE_SCREENS: usize = 6;
+/// Bounds on the memory that comes to, for windows very small and very large.
+const TILE_BUDGET: std::ops::RangeInclusive<usize> = 24 * 1024 * 1024..=256 * 1024 * 1024;
 const TEXT_CACHE: usize = 48;
-const THUMBNAIL_CACHE: usize = 256;
+/// The sidebar shows about twenty thumbnails at once, counting those built
+/// just out of sight.
+const THUMBNAIL_CACHE: usize = 32;
 
 const SCROLLBAR_WIDTH: f32 = 8.0;
 const SCROLLBAR_INSET: f32 = 3.0;
@@ -647,6 +653,15 @@ impl Viewer {
         wanted
     }
 
+    /// Bytes of rendered tiles to keep: [`TILE_SCREENS`] times the pixels of
+    /// the view.
+    fn tile_budget(&self) -> usize {
+        let scale = self.scale_factor as f64;
+        let pixels = (self.viewport.width as f64 * scale) * (self.viewport.height as f64 * scale);
+
+        (pixels as usize * 4 * TILE_SCREENS).clamp(*TILE_BUDGET.start(), *TILE_BUDGET.end())
+    }
+
     pub fn insert_tile(&mut self, key: TileKey, bitmap: Bitmap) {
         let bytes = bitmap.rgba.len();
         let handle = image::Handle::from_rgba(bitmap.width, bitmap.height, bitmap.rgba);
@@ -657,7 +672,9 @@ impl Viewer {
 
         self.tile_bytes += bytes;
 
-        while self.tile_bytes > TILE_BUDGET {
+        let budget = self.tile_budget();
+
+        while self.tile_bytes > budget {
             match self.tiles.pop_lru() {
                 Some((_, tile)) => self.tile_bytes -= tile.bytes,
                 None => break,
