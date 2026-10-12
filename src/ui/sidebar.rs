@@ -16,6 +16,8 @@ use crate::engine::DocInfo;
 use crate::ui::icon::Icon;
 use crate::ui::theme::{self, Palette};
 
+/// Height of the row of tabs above the list.
+pub const HEADER: f32 = 42.0;
 const OUTLINE_ROW: f32 = 28.0;
 const PAGE_ROW: f32 = 206.0;
 const THUMBNAIL_BOX: (f32, f32) = (136.0, 168.0);
@@ -245,6 +247,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
         ]
         .spacing(4),
     )
+    .height(HEADER)
     .padding([8, 10]);
 
     let body: Element<'_, Message> = match (app.viewer.document(), state.tab) {

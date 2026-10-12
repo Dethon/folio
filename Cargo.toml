@@ -8,21 +8,43 @@ license = "MIT"
 repository = "https://github.com/Dethon/folio"
 
 [dependencies]
-iced = { version = "0.14", features = ["image", "svg", "advanced", "tokio"] }
+# Named features rather than the defaults: no image codecs (pages arrive as
+# raw pixels), no SVG support (see `ui/icon.rs`) and no second executor.
+iced = { version = "0.14", default-features = false, features = [
+    "wgpu",
+    "tiny-skia",
+    "crisp",
+    "web-colors",
+    "x11",
+    "wayland",
+    "image-without-codecs",
+    "advanced",
+    "tokio",
+] }
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
 pdfium-render = { version = "0.9.4", default-features = false, features = ["pdfium_latest", "thread_safe"] }
 rfd = "0.17"
 lru = "0.18"
+log = "0.4"
 image = { version = "0.25", default-features = false, features = ["png"] }
+# Icons only: none of them contains text, so no font support.
+resvg = { version = "0.45", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 libloading = "0.8"
 memmap2 = "0.9"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_Storage_Xps",
     "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_ProcessStatus",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
     "Win32_UI_Controls_Dialogs",
+    "Win32_UI_HiDpi",
 ] }
 
 [profile.release]
@@ -37,5 +59,3 @@ opt-level = 2
 
 [dev-dependencies]
 iced_test = "0.14"
-# Only for `examples/make-icon`; the same version Iced already pulls in.
-resvg = { version = "0.45", default-features = false }

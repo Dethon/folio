@@ -1,35 +1,44 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
 
 use pdfium_render::prelude::*;
+
+use crate::trace;
 
 use super::table::Rule;
 use super::text::{self, Glyph, Rect};
 use super::{
-    Bitmap, CopyRequest, DocInfo, Event, Job, JobKind, MATCH_LIMIT, Match, OutlineItem, PageSize,
-    PageText, SearchRequest, Shared, THUMBNAIL_WIDTH, TILE, TileKey, markdown, page_pixels, print,
+    Bitmap, CopyRequest, DocInfo, Event, Job, JobKind, MATCH_LIMIT, Match, Open, OutlineItem,
+    PageSize, PageText, SearchRequest, Shared, THUMBNAIL_WIDTH, TILE, TileKey, Wanted, markdown,
+    page_pixels, print,
 };
 
 type Emit = Box<dyn Fn(Event) + Send>;
 
 /// Parsed pages kept alive between tasks. Tiles of the same page arrive in
-/// bursts, and re-parsing a content stream per tile would dominate.
-const PAGE_CACHE: usize = 8;
-
-/// A tile finished this recently is not rendered again: the UI may have
-/// asked for it once more before our result reached it.
-const RECENT_WINDOW: Duration = Duration::from_millis(300);
+/// bursts, and re-parsing a content stream per tile would dominate. No more
+/// than the pages around the view, though: a parsed page holds every image
+/// on it decoded, which runs to megabytes each.
+const PAGE_CACHE: usize = 4;
 
 const OUTLINE_LIMIT: usize = 20_000;
+
+/// Pages parsed through one handle on the document before it is replaced.
+const RECYCLE_AFTER: u32 = 96;
+
+/// Pages a search may rule out, from what it remembers of their text, before
+/// it looks at the queue again.
+const SEARCH_STRIDE: u32 = 256;
 
 pub(crate) fn run(shared: Arc<Shared>, emit: Emit) {
     let pdfium = pdfium();
     let mut next_id = 1u64;
 
+    trace::mark("engine: pdfium bound");
+
     loop {
-        let Some(path) = next_open(&shared) else {
+        let Some(Open { path, plan }) = next_open(&shared) else {
             return;
         };
 
@@ -58,15 +67,35 @@ pub(crate) fn run(shared: Arc<Shared>, emit: Emit) {
         let info = Arc::new(describe(&document, next_id, &path));
         next_id += 1;
 
+        trace::mark("engine: document described");
+
+        // Start on what the UI is expected to ask for, unless it has moved
+        // on to another document already.
+        if let Some(plan) = plan {
+            let wanted = plan(&info);
+
+            if let Ok(mut queue) = shared.queue.lock()
+                && queue.open.is_none()
+            {
+                queue.doc = info.id;
+                queue.wanted = wanted;
+            }
+        }
+
         emit(Event::Opened(info.clone()));
 
         let session = Session {
-            document: &document,
+            pdfium,
+            pages: VecDeque::new(),
+            document,
+            parsed: 0,
+            scratch: None,
+            haystacks: (0..info.pages.len()).map(|_| None).collect(),
             info,
             shared: &shared,
             emit: &emit,
-            pages: VecDeque::new(),
-            recent: VecDeque::new(),
+            sent: VecDeque::new(),
+            tiles_sent: 0,
             copy: None,
             search: None,
             job: None,
@@ -108,7 +137,7 @@ fn load_pdfium() -> Result<Pdfium, String> {
 }
 
 /// Blocks until a document should be opened. `None` means shut down.
-fn next_open(shared: &Shared) -> Option<PathBuf> {
+fn next_open(shared: &Shared) -> Option<Open> {
     let mut queue = shared.queue.lock().ok()?;
 
     loop {
@@ -116,14 +145,12 @@ fn next_open(shared: &Shared) -> Option<PathBuf> {
             return None;
         }
 
-        if let Some(path) = queue.open.take() {
-            return Some(path);
+        if let Some(open) = queue.open.take() {
+            return Some(open);
         }
 
         // Nothing is open, so nothing else in the queue can be served.
-        queue.tiles.clear();
-        queue.texts.clear();
-        queue.thumbnails.clear();
+        queue.wanted = Wanted::default();
         queue.copy = None;
         queue.search = None;
         queue.jobs.clear();
@@ -219,7 +246,10 @@ enum Exit {
 }
 
 enum Task {
-    Tile(TileKey),
+    /// Nothing is left to do: let go of what the work needed.
+    Tidy,
+    /// A tile, and how many the UI had taken in when it asked.
+    Tile(TileKey, u64),
     Text(u32),
     Thumbnail(u32),
     Copy(CopyRequest),
@@ -264,12 +294,29 @@ impl Active {
 }
 
 struct Session<'s, 'p> {
-    document: &'s PdfDocument<'p>,
+    pdfium: &'p Pdfium,
+    /// Parsed pages of `document`, most recently used first. Declared, and
+    /// so dropped, ahead of it.
+    pages: VecDeque<(u32, PdfPage<'p>)>,
+    /// PDFium keeps what it has parsed of a document for as long as the
+    /// document is open, which once every page has been read comes to more
+    /// than the file itself. So no handle is kept for long: this one is
+    /// traded for a fresh one every [`RECYCLE_AFTER`] pages.
+    document: PdfDocument<'p>,
+    /// Pages parsed through `document` since it was opened.
+    parsed: u32,
+    /// A second handle on the file, for work that walks the whole document.
+    /// It is closed as soon as the work is done.
+    scratch: Option<PdfDocument<'p>>,
+    /// The text of each page searched so far, as search sees it.
+    haystacks: Vec<Option<text::Haystack>>,
     info: Arc<DocInfo>,
     shared: &'s Shared,
     emit: &'s Emit,
-    pages: VecDeque<(u32, PdfPage<'p>)>,
-    recent: VecDeque<(TileKey, Instant)>,
+    /// Tiles sent that the UI is not known to have taken in yet, each with
+    /// its place in the count of all sent. See [`Wanted::received`].
+    sent: VecDeque<(TileKey, u64)>,
+    tiles_sent: u64,
     copy: Option<Copy>,
     search: Option<Search>,
     job: Option<Active>,
@@ -292,12 +339,17 @@ impl<'p> Session<'_, 'p> {
                         return Exit::Reopen;
                     }
 
-                    if !queue.tiles.is_empty() {
-                        break Task::Tile(queue.tiles.remove(0));
+                    // Left over from a document that has since been replaced.
+                    if queue.doc != self.info.id {
+                        queue.wanted = Wanted::default();
                     }
 
-                    if !queue.texts.is_empty() {
-                        break Task::Text(queue.texts.remove(0));
+                    if !queue.wanted.tiles.is_empty() {
+                        break Task::Tile(queue.wanted.tiles.remove(0), queue.wanted.received);
+                    }
+
+                    if !queue.wanted.texts.is_empty() {
+                        break Task::Text(queue.wanted.texts.remove(0));
                     }
 
                     // A copy is interactive, so it runs ahead of long jobs.
@@ -326,8 +378,12 @@ impl<'p> Session<'_, 'p> {
                         break Task::Start(job);
                     }
 
-                    if !queue.thumbnails.is_empty() {
-                        break Task::Thumbnail(queue.thumbnails.remove(0));
+                    if !queue.wanted.thumbnails.is_empty() {
+                        break Task::Thumbnail(queue.wanted.thumbnails.remove(0));
+                    }
+
+                    if self.scratch.is_some() || self.parsed >= RECYCLE_AFTER {
+                        break Task::Tidy;
                     }
 
                     let Ok(guard) = self.shared.wake.wait(queue) else {
@@ -338,7 +394,8 @@ impl<'p> Session<'_, 'p> {
             };
 
             match task {
-                Task::Tile(key) => self.tile(key),
+                Task::Tidy => self.tidy(),
+                Task::Tile(key, received) => self.tile(key, received),
                 Task::Text(page) => self.text(page),
                 Task::Thumbnail(page) => self.thumbnail(page),
                 Task::Copy(request) => {
@@ -376,6 +433,7 @@ impl<'p> Session<'_, 'p> {
         } else {
             let page = self.document.pages().get(index as PdfPageIndex).ok()?;
 
+            self.parsed += 1;
             self.pages.push_front((index, page));
             self.pages.truncate(PAGE_CACHE);
         }
@@ -383,17 +441,66 @@ impl<'p> Session<'_, 'p> {
         self.pages.front().map(|(_, page)| page)
     }
 
+    /// Lets go of what PDFium has built up, now that nothing is waiting.
+    fn tidy(&mut self) {
+        self.scratch = None;
+
+        if self.parsed < RECYCLE_AFTER {
+            return;
+        }
+
+        self.parsed = 0;
+
+        // Should the file have gone, or been replaced by another, since it
+        // was opened, the handle that has it open carries on.
+        if let Ok(fresh) = self.pdfium.load_pdf_from_file(&self.info.path, None)
+            && fresh.pages().len() as usize == self.info.pages.len()
+        {
+            self.pages.clear();
+            self.document = fresh;
+        }
+    }
+
+    /// Loads a page for a pass over the whole document: from the cache if
+    /// it happens to be there, and otherwise through the scratch handle,
+    /// without keeping it. Caching it would push out the pages on screen.
+    fn with_passing_page<T>(&mut self, index: u32, f: impl FnOnce(&PdfPage) -> T) -> Option<T> {
+        if let Some((_, page)) = self.pages.iter().find(|(page, _)| *page == index) {
+            return Some(f(page));
+        }
+
+        if self.scratch.is_none() {
+            self.scratch = self
+                .pdfium
+                .load_pdf_from_file(&self.info.path, None)
+                .ok()
+                .filter(|scratch| scratch.pages().len() as usize == self.info.pages.len());
+        }
+
+        // The file may have gone since it was opened; the handle that has
+        // it open still works.
+        let document = self.scratch.as_ref().unwrap_or(&self.document);
+        let page = document.pages().get(index as PdfPageIndex).ok()?;
+
+        Some(f(&page))
+    }
+
     fn size(&self, page: u32) -> Option<PageSize> {
         self.info.pages.get(page as usize).copied()
     }
 
-    fn tile(&mut self, key: TileKey) {
-        let now = Instant::now();
+    fn tile(&mut self, key: TileKey, received: u64) {
+        // What the UI had by the time it asked is no longer on its way; if
+        // it asks for any of that, it has let go of it since.
+        while self
+            .sent
+            .front()
+            .is_some_and(|(_, place)| *place <= received)
+        {
+            self.sent.pop_front();
+        }
 
-        self.recent
-            .retain(|(_, at)| now.duration_since(*at) < RECENT_WINDOW);
-
-        if self.recent.iter().any(|(recent, _)| *recent == key) {
+        if self.sent.iter().any(|(sent, _)| *sent == key) {
             return;
         }
 
@@ -423,7 +530,9 @@ impl<'p> Session<'_, 'p> {
         };
 
         if let Some(bitmap) = render(page, region) {
-            self.recent.push_back((key, Instant::now()));
+            trace::mark("engine: first tile rendered");
+            self.tiles_sent += 1;
+            self.sent.push_back((key, self.tiles_sent));
 
             (self.emit)(Event::Tile {
                 doc: self.info.id,
@@ -452,11 +561,21 @@ impl<'p> Session<'_, 'p> {
             height,
         };
 
-        let Some(page) = self.page(index) else {
-            return;
+        // A thumbnail is all that is wanted of most pages it is asked for,
+        // so the page is not kept for more: see `PAGE_CACHE`.
+        let bitmap = match self.pages.iter().find(|(page, _)| *page == index) {
+            Some((_, page)) => render(page, region),
+            None => {
+                self.parsed += 1;
+                self.document
+                    .pages()
+                    .get(index as PdfPageIndex)
+                    .ok()
+                    .and_then(|page| render(&page, region))
+            }
         };
 
-        if let Some(bitmap) = render(page, region) {
+        if let Some(bitmap) = bitmap {
             (self.emit)(Event::Thumbnail {
                 doc: self.info.id,
                 page: index,
@@ -466,16 +585,28 @@ impl<'p> Session<'_, 'p> {
     }
 
     fn text(&mut self, index: u32) {
-        let text = self
-            .page(index)
-            .and_then(|page| extract(page, false))
-            .unwrap_or_default();
+        let text = self.page(index).and_then(|page| extract(page, false));
+
+        // A page that could not be read is not remembered as blank: that
+        // would rule it out of every search to come.
+        if let Some(text) = &text {
+            self.remember(index, text);
+        }
+
+        let text = text.unwrap_or_default();
 
         (self.emit)(Event::Text {
             doc: self.info.id,
             page: index,
             text: Arc::new(text),
         });
+    }
+
+    /// Keeps what a search needs of a page's text, for the searches to come.
+    fn remember(&mut self, index: u32, text: &PageText) {
+        if let Some(haystack @ None) = self.haystacks.get_mut(index as usize) {
+            *haystack = Some(text.haystack());
+        }
     }
 
     fn start(&mut self, job: Job) {
@@ -522,7 +653,10 @@ impl<'p> Session<'_, 'p> {
 
         let page = copy.page;
 
-        if let Some(text) = self.page(page).and_then(|page| extract(page, false)) {
+        if let Some(text) = self
+            .with_passing_page(page, |page| extract(page, false))
+            .flatten()
+        {
             let range = text::selected_range(&text, page, &from, &to, granularity);
             let piece = text.text(range);
 
@@ -536,13 +670,28 @@ impl<'p> Session<'_, 'p> {
         self.copy = Some(copy);
     }
 
-    /// Searches one more page.
+    /// Searches on: past the pages known not to hold the query, which cost
+    /// next to nothing, and through one that might.
     fn search_step(&mut self) {
         let Some(mut search) = self.search.take() else {
             return;
         };
 
         let pages = self.info.pages.len() as u32;
+
+        // Bounded, so that a long run of misses cannot hold up a tile.
+        for _ in 0..SEARCH_STRIDE {
+            let ruled_out = search.done < pages
+                && self.haystacks[((search.from + search.done) % pages) as usize]
+                    .as_ref()
+                    .is_some_and(|haystack| !haystack.contains(&search.needle));
+
+            if !ruled_out {
+                break;
+            }
+
+            search.done += 1;
+        }
 
         if search.done >= pages || search.found >= MATCH_LIMIT {
             (self.emit)(Event::SearchDone {
@@ -555,19 +704,22 @@ impl<'p> Session<'_, 'p> {
 
         let index = (search.from + search.done) % pages;
 
-        // A search walks the whole document, so a page it has to load is not
-        // kept: that would push the pages on screen out of the cache.
-        let text = match self.pages.iter().find(|(page, _)| *page == index) {
-            Some((_, page)) => extract(page, false),
-            None => self
-                .document
-                .pages()
-                .get(index as PdfPageIndex)
-                .ok()
-                .and_then(|page| extract(&page, false)),
-        };
+        // Still to be ruled out; the next step takes it from there.
+        if self.haystacks[index as usize]
+            .as_ref()
+            .is_some_and(|haystack| !haystack.contains(&search.needle))
+        {
+            self.search = Some(search);
+            return;
+        }
+
+        let text = self
+            .with_passing_page(index, |page| extract(page, false))
+            .flatten();
 
         if let Some(text) = text {
+            self.remember(index, &text);
+
             let matches: Vec<Match> = text
                 .find(&search.needle)
                 .into_iter()
@@ -616,8 +768,9 @@ impl<'p> Session<'_, 'p> {
                         height: 792.0,
                     });
                     let (text, rules) = self
-                        .page(page)
-                        .map(|page| (extract(page, true).unwrap_or_default(), rules(page)))
+                        .with_passing_page(page, |page| {
+                            (extract(page, true).unwrap_or_default(), rules(page))
+                        })
                         .unwrap_or_default();
 
                     pages.push(markdown::Page::new(&text, size, rules));
@@ -1023,8 +1176,12 @@ fn extract(page: &PdfPage, styled: bool) -> Option<PageText> {
         glyphs.push(glyph);
     }
 
+    // Judged once per font, not once per glyph: it sorts every advance the
+    // font was seen at.
+    let monospaced: Vec<bool> = fonts.entries.iter().map(Font::is_monospaced).collect();
+
     for (glyph, font) in glyphs.iter_mut().zip(&glyph_fonts) {
-        if fonts.entries.get(*font).is_some_and(Font::is_monospaced) {
+        if monospaced.get(*font).copied().unwrap_or(false) {
             glyph.style |= text::MONO;
         }
     }

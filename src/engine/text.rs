@@ -370,10 +370,97 @@ struct Folded {
     soft: bool,
 }
 
+/// The text of a page as search sees it, without the glyphs it came from:
+/// enough to tell whether a query occurs on the page, at about a byte a
+/// character. Kept for every page searched, so that later searches only
+/// read the pages they will find something on.
+#[derive(Debug, Default)]
+pub struct Haystack {
+    text: Box<str>,
+    /// Byte offsets in `text` of the hyphens that break a word at the end
+    /// of a line, in order.
+    soft: Box<[u32]>,
+}
+
+impl Haystack {
+    /// Whether [`PageText::find`] would find `needle` on the page.
+    pub fn contains(&self, needle: &Needle) -> bool {
+        let first = needle.0[0];
+
+        self.text
+            .char_indices()
+            .any(|(start, ch)| ch == first && self.matches_at(start, &needle.0))
+    }
+
+    /// The counterpart of [`match_at`].
+    fn matches_at(&self, start: usize, needle: &[char]) -> bool {
+        let mut chars = self.text[start..].char_indices();
+
+        for (index, wanted) in needle.iter().enumerate() {
+            loop {
+                let Some((offset, have)) = chars.next() else {
+                    return false;
+                };
+
+                if have == *wanted {
+                    break;
+                }
+
+                let soft = self.soft.binary_search(&((start + offset) as u32)).is_ok();
+
+                if !soft || index == 0 {
+                    return false;
+                }
+            }
+        }
+
+        true
+    }
+}
+
 impl PageText {
+    /// The page's text reduced to what a search needs to rule the page out.
+    pub fn haystack(&self) -> Haystack {
+        let folded = self.folded();
+        let mut text = String::with_capacity(folded.len());
+        let mut soft = Vec::new();
+
+        for folded in &folded {
+            if folded.soft {
+                soft.push(text.len() as u32);
+            }
+
+            text.push(folded.ch);
+        }
+
+        Haystack {
+            text: text.into(),
+            soft: soft.into(),
+        }
+    }
+
     /// Every occurrence of `needle`, as glyph ranges in reading order.
     /// Occurrences may run across line ends but do not overlap.
     pub fn find(&self, needle: &Needle) -> Vec<Range<u32>> {
+        let folded = self.folded();
+        let mut found = Vec::new();
+        let mut start = 0;
+
+        while start < folded.len() {
+            match match_at(&folded, start, &needle.0) {
+                Some(end) => {
+                    found.push(folded[start].glyph..folded[end - 1].glyph + 1);
+                    start = end;
+                }
+                None => start += 1,
+            }
+        }
+
+        found
+    }
+
+    /// The page's characters in reading order, folded for matching.
+    fn folded(&self) -> Vec<Folded> {
         let mut folded: Vec<Folded> = Vec::with_capacity(self.glyphs.len());
         let space = |folded: &mut Vec<Folded>, glyph: u32| {
             if folded.last().is_some_and(|last| last.ch != ' ') {
@@ -410,20 +497,7 @@ impl PageText {
             }
         }
 
-        let mut found = Vec::new();
-        let mut start = 0;
-
-        while start < folded.len() {
-            match match_at(&folded, start, &needle.0) {
-                Some(end) => {
-                    found.push(folded[start].glyph..folded[end - 1].glyph + 1);
-                    start = end;
-                }
-                None => start += 1,
-            }
-        }
-
-        found
+        folded
     }
 }
 
@@ -713,11 +787,16 @@ mod tests {
 
     fn found(text: &PageText, query: &str) -> Vec<String> {
         let needle = Needle::new(query).expect("query is not empty");
+        let found = text.find(&needle);
 
-        text.find(&needle)
-            .into_iter()
-            .map(|range| text.text(range))
-            .collect()
+        // The page's haystack is to agree with the search proper, always.
+        assert_eq!(
+            text.haystack().contains(&needle),
+            !found.is_empty(),
+            "{query:?}"
+        );
+
+        found.into_iter().map(|range| text.text(range)).collect()
     }
 
     #[test]
