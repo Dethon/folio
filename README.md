@@ -127,7 +127,8 @@ However it is shipped, `folio.exe` and `pdfium.dll` must stay together.
   until there is input.
 - **One graphics backend.** On Windows the renderer is pinned to Direct3D 12
   instead of probing Vulkan and OpenGL as well, which saves start-up time and
-  about 80 MB. Set `WGPU_BACKEND` to override.
+  about 80 MB. Set `WGPU_BACKEND` to override; `gl` in particular is worth
+  trying, see below.
 
 Measured on Windows 11 (Ryzen 9 9950X3D, RTX 4090, 240 Hz display) with a
 501-page book, release build:
@@ -152,6 +153,27 @@ The graphics driver is what the two headline numbers are made of, and it is
 the one part that differs from machine to machine: an empty window is 98 MB
 and 0.3 s of the figures above.
 
+### A faster start on OpenGL
+
+`WGPU_BACKEND=gl` runs the same renderer on OpenGL, and draws the same
+pixels. On the machine above its driver is ready in a third of the time:
+
+| | Direct3D 12 | OpenGL |
+|---|---|---|
+| Launch to first page fully rendered | 0.35 s | 0.17 s |
+| Memory with the book open | 120 MB working set, 76 MB of it private (Task Manager's figure) | 90 MB, 54 MB private |
+| Memory after scrolling through 40 pages | 140 MB | 113 MB |
+| Processor time while scrolling at 240 Hz | 16 % of a core | 48 % of a core |
+| Threads | 23 | 18 |
+
+It is not the default for two reasons. It has been measured on that one
+NVIDIA card, and OpenGL drivers vary more between makers than Direct3D ones
+do. And it costs three times the processor while scrolling, most of it on the
+driver's own threads, with one hitch of 20 ms on the first scroll after
+launch. Folio already does what it can about the first: left to wait for the
+display itself, the driver spins a core, so on OpenGL frames are presented at
+once and paced against the compositor instead (`src/graphics.rs`).
+
 ### Measuring it
 
 Three undocumented switches produce the numbers above:
@@ -172,6 +194,7 @@ attributed, at some cost to the timings themselves.
 ```
 src/
   main.rs            command line
+  graphics.rs        choice of graphics backend, frame pacing on OpenGL
   app.rs             state, messages, update loop
   trace.rs           start-up timeline and memory report (FOLIO_TRACE)
   bench.rs           engine benchmark (--bench)
