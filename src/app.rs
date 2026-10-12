@@ -860,6 +860,11 @@ impl App {
         // The first interval runs from the end of loading, not from a frame.
         let mut intervals = test.intervals.split_off(1);
         let incomplete = test.incomplete;
+        let slowest = intervals
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map_or(0, |(frame, _)| frame + 1);
 
         intervals.sort_by(f32::total_cmp);
 
@@ -869,7 +874,7 @@ impl App {
         trace::note(|| {
             format!(
                 "scroll test: {} frames, interval p50 {:.2} ms, p95 {:.2} ms, p99 {:.2} ms, \
-                 max {:.2} ms; {incomplete} frames with tiles in view missing",
+                 max {:.2} ms at frame {slowest}; {incomplete} frames with tiles in view missing",
                 intervals.len(),
                 at(0.5),
                 at(0.95),
