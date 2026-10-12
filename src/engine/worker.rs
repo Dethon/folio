@@ -29,10 +29,6 @@ const RECENT_WINDOW: Duration = Duration::from_millis(300);
 
 const OUTLINE_LIMIT: usize = 20_000;
 
-/// How long the parsed pages are kept with nothing asking for them. Reading
-/// a page takes longer than this; scrolling on to the next does not.
-const REST_AFTER: Duration = Duration::from_secs(3);
-
 /// Pages parsed through one handle on the document before it is replaced.
 const RECYCLE_AFTER: u32 = 96;
 
@@ -256,8 +252,6 @@ enum Exit {
 enum Task {
     /// Nothing is left to do: let go of what the work needed.
     Tidy,
-    /// Nothing has been asked for in a while: let go of the parsed pages.
-    Rest,
     Tile(TileKey),
     Text(u32),
     Thumbnail(u32),
@@ -392,30 +386,15 @@ impl<'p> Session<'_, 'p> {
                         break Task::Tidy;
                     }
 
-                    // With parsed pages in hand, wait only so long for more
-                    // work on them; without, for as long as it takes.
-                    if self.pages.is_empty() {
-                        let Ok(guard) = self.shared.wake.wait(queue) else {
-                            return Exit::Shutdown;
-                        };
-                        queue = guard;
-                    } else {
-                        let Ok((guard, wait)) = self.shared.wake.wait_timeout(queue, REST_AFTER)
-                        else {
-                            return Exit::Shutdown;
-                        };
-                        queue = guard;
-
-                        if wait.timed_out() {
-                            break Task::Rest;
-                        }
-                    }
+                    let Ok(guard) = self.shared.wake.wait(queue) else {
+                        return Exit::Shutdown;
+                    };
+                    queue = guard;
                 }
             };
 
             match task {
                 Task::Tidy => self.tidy(),
-                Task::Rest => self.pages.clear(),
                 Task::Tile(key) => self.tile(key),
                 Task::Text(page) => self.text(page),
                 Task::Thumbnail(page) => self.thumbnail(page),
@@ -600,12 +579,15 @@ impl<'p> Session<'_, 'p> {
     }
 
     fn text(&mut self, index: u32) {
-        let text = self
-            .page(index)
-            .and_then(|page| extract(page, false))
-            .unwrap_or_default();
+        let text = self.page(index).and_then(|page| extract(page, false));
 
-        self.remember(index, &text);
+        // A page that could not be read is not remembered as blank: that
+        // would rule it out of every search to come.
+        if let Some(text) = &text {
+            self.remember(index, text);
+        }
+
+        let text = text.unwrap_or_default();
 
         (self.emit)(Event::Text {
             doc: self.info.id,

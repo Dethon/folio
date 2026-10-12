@@ -124,8 +124,7 @@ However it is shipped, `folio.exe` and `pdfium.dll` must stay together.
   say every keystroke after the first, only open the pages they will find
   something on.
 - **Idle means idle.** There are no timers or animation loops; nothing runs
-  until there is input. Three seconds after the last of it, the engine lets
-  go of the pages it had parsed.
+  until there is input.
 - **One graphics backend.** On Windows the renderer is pinned to Direct3D 12
   instead of probing Vulkan and OpenGL as well, which saves start-up time and
   about 80 MB. Set `WGPU_BACKEND` to override.
@@ -139,7 +138,8 @@ Measured on Windows 11 (Ryzen 9 9950X3D, RTX 4090, 240 Hz display) with a
 | First screen rendered by the engine | 30 ms after launch |
 | Rendering | 0.66 ms per tile, 250 megapixels a second |
 | Continuous scrolling | steady at the display's 240 Hz, 4.5 ms p95 frame interval, no frame with a tile missing |
-| Search of the whole book | 6 ms for a phrase that is not there, 47 ms for a word found 174 times, 270 ms for one on nearly every page |
+| First search of the whole book | 0.28 s, with matches shown as they are found, from the page being read |
+| Later searches | 6 ms for a phrase that is not there, 47 ms for a word found 174 times, 0.27 s for one on nearly every page |
 | Markdown export of all 501 pages | 0.42 s |
 | Memory with the book open | 120 MB working set, 98 MB of it the window and the graphics driver |
 | Memory after scrolling through 40 pages | 138 MB |
