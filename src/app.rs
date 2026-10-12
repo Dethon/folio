@@ -238,10 +238,11 @@ impl App {
             icon::set_scale_factor(scale_factor);
         }
 
-        app.viewer.set_viewport(ui::page_view_size(
-            WINDOW,
-            app.options.sidebar.as_deref() != Some("hidden"),
-        ));
+        let view = ui::page_view_size(WINDOW, app.options.sidebar.as_deref() != Some("hidden"));
+
+        app.viewer.set_viewport(view);
+        // The sidebar's list reports its height only once it is scrolled.
+        app.sidebar.height = view.height - sidebar::HEADER;
 
         if let Some(path) = app.options.file.clone() {
             app.open(path);
@@ -467,7 +468,10 @@ impl App {
 
         if page != page_before {
             self.refresh_page_input();
-            return Task::batch([produced, task, self.sidebar.reveal_page(page)]);
+
+            // After what the engine's events asked for: a new document
+            // sends the sidebar to the top first, then to the page.
+            return Task::batch([produced.chain(self.sidebar.reveal_page(page)), task]);
         }
 
         Task::batch([produced, task])
