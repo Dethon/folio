@@ -703,6 +703,44 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn carries_on_across_a_change_of_handle() {
+        let fixture = open_fixture();
+
+        let first_line = |fixture: &Fixture| {
+            fixture.want(Wanted {
+                texts: vec![0],
+                ..Wanted::default()
+            });
+
+            let text = fixture.wait(|event| match event {
+                Event::Text { page: 0, text, .. } => Some(text),
+                _ => None,
+            });
+
+            text.text(text.lines[0].glyphs.clone())
+        };
+
+        let before = first_line(&fixture);
+
+        // Thumbnails parse their page afresh each time, so enough of them
+        // has the engine trade its handle on the document for a new one.
+        for round in 0..150 {
+            fixture.want(Wanted {
+                thumbnails: vec![1 + round % 2],
+                ..Wanted::default()
+            });
+
+            fixture.wait(|event| match event {
+                Event::Thumbnail { .. } => Some(()),
+                _ => None,
+            });
+        }
+
+        assert_eq!(first_line(&fixture), before);
+        assert_eq!(search(&fixture, 9, "closing remarks", 0).len(), 1);
+    }
+
+    #[test]
     fn exports_markdown() {
         let fixture = open_fixture();
         let dest = std::env::temp_dir().join(format!("folio-export-{}.md", std::process::id()));

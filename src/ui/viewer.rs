@@ -49,11 +49,11 @@ const ZOOM_STEPS: [f32; 17] = [
 /// scrolled back to without rendering it again.
 const TILE_SCREENS: usize = 6;
 /// Bounds on the memory that comes to, for windows very small and very large.
-const TILE_BUDGET: std::ops::RangeInclusive<usize> = 24 * 1024 * 1024..=256 * 1024 * 1024;
+const TILE_BUDGET: std::ops::RangeInclusive<usize> = 16 * 1024 * 1024..=256 * 1024 * 1024;
 const TEXT_CACHE: usize = 48;
-/// The sidebar shows about twenty thumbnails at once, counting those built
-/// just out of sight.
-const THUMBNAIL_CACHE: usize = 32;
+/// Thumbnails kept beyond those the sidebar is showing: the ones standing in
+/// for pages in view, and a few the sidebar has just scrolled past.
+const THUMBNAIL_SPARE: usize = 12;
 
 const SCROLLBAR_WIDTH: f32 = 8.0;
 const SCROLLBAR_INSET: f32 = 3.0;
@@ -136,7 +136,7 @@ impl Default for Viewer {
             tiles: LruCache::unbounded(),
             tile_bytes: 0,
             stale_scale: None,
-            thumbnails: LruCache::new(NonZeroUsize::new(THUMBNAIL_CACHE).unwrap()),
+            thumbnails: LruCache::new(NonZeroUsize::new(THUMBNAIL_SPARE).unwrap()),
             texts: LruCache::new(NonZeroUsize::new(TEXT_CACHE).unwrap()),
             selection: None,
             matches: Vec::new(),
@@ -643,6 +643,14 @@ impl Viewer {
             self.stale_scale = None;
         }
 
+        // Room for what the sidebar shows and no more: with the sidebar
+        // shut, that is none.
+        if let Some(capacity) = NonZeroUsize::new(sidebar_thumbnails.len() + THUMBNAIL_SPARE)
+            && capacity != self.thumbnails.cap()
+        {
+            self.thumbnails.resize(capacity);
+        }
+
         // Thumbnails stand in for pages whose tiles are still rendering.
         for page in visible.chain(sidebar_thumbnails) {
             if self.thumbnails.get(&page).is_none() && !wanted.thumbnails.contains(&page) {
@@ -680,6 +688,22 @@ impl Viewer {
                 None => break,
             }
         }
+    }
+
+    /// Development aid: what the caches hold, for the trace.
+    pub fn cache_report(&self) -> String {
+        format!(
+            "{} tiles in {:.1} MiB (budget {:.1} MiB), {} thumbnails, {} text layers of {} glyphs",
+            self.tiles.len(),
+            self.tile_bytes as f64 / (1024.0 * 1024.0),
+            self.tile_budget() as f64 / (1024.0 * 1024.0),
+            self.thumbnails.len(),
+            self.texts.len(),
+            self.texts
+                .iter()
+                .map(|(_, text)| text.glyphs.len())
+                .sum::<usize>(),
+        )
     }
 
     pub fn insert_thumbnail(&mut self, page: u32, bitmap: Bitmap) {

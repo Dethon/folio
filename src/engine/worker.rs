@@ -18,14 +18,27 @@ use super::{
 type Emit = Box<dyn Fn(Event) + Send>;
 
 /// Parsed pages kept alive between tasks. Tiles of the same page arrive in
-/// bursts, and re-parsing a content stream per tile would dominate.
-const PAGE_CACHE: usize = 8;
+/// bursts, and re-parsing a content stream per tile would dominate. No more
+/// than the pages around the view, though: a parsed page holds every image
+/// on it decoded, which runs to megabytes each.
+const PAGE_CACHE: usize = 4;
 
 /// A tile finished this recently is not rendered again: the UI may have
 /// asked for it once more before our result reached it.
 const RECENT_WINDOW: Duration = Duration::from_millis(300);
 
 const OUTLINE_LIMIT: usize = 20_000;
+
+/// How long the parsed pages are kept with nothing asking for them. Reading
+/// a page takes longer than this; scrolling on to the next does not.
+const REST_AFTER: Duration = Duration::from_secs(3);
+
+/// Pages parsed through one handle on the document before it is replaced.
+const RECYCLE_AFTER: u32 = 96;
+
+/// Pages a search may rule out, from what it remembers of their text, before
+/// it looks at the queue again.
+const SEARCH_STRIDE: u32 = 256;
 
 pub(crate) fn run(shared: Arc<Shared>, emit: Emit) {
     let pdfium = pdfium();
@@ -81,11 +94,15 @@ pub(crate) fn run(shared: Arc<Shared>, emit: Emit) {
         emit(Event::Opened(info.clone()));
 
         let session = Session {
-            document: &document,
+            pdfium,
+            pages: VecDeque::new(),
+            document,
+            parsed: 0,
+            scratch: None,
+            haystacks: (0..info.pages.len()).map(|_| None).collect(),
             info,
             shared: &shared,
             emit: &emit,
-            pages: VecDeque::new(),
             recent: VecDeque::new(),
             copy: None,
             search: None,
@@ -237,6 +254,10 @@ enum Exit {
 }
 
 enum Task {
+    /// Nothing is left to do: let go of what the work needed.
+    Tidy,
+    /// Nothing has been asked for in a while: let go of the parsed pages.
+    Rest,
     Tile(TileKey),
     Text(u32),
     Thumbnail(u32),
@@ -282,11 +303,25 @@ impl Active {
 }
 
 struct Session<'s, 'p> {
-    document: &'s PdfDocument<'p>,
+    pdfium: &'p Pdfium,
+    /// Parsed pages of `document`, most recently used first. Declared, and
+    /// so dropped, ahead of it.
+    pages: VecDeque<(u32, PdfPage<'p>)>,
+    /// PDFium keeps what it has parsed of a document for as long as the
+    /// document is open, which once every page has been read comes to more
+    /// than the file itself. So no handle is kept for long: this one is
+    /// traded for a fresh one every [`RECYCLE_AFTER`] pages.
+    document: PdfDocument<'p>,
+    /// Pages parsed through `document` since it was opened.
+    parsed: u32,
+    /// A second handle on the file, for work that walks the whole document.
+    /// It is closed as soon as the work is done.
+    scratch: Option<PdfDocument<'p>>,
+    /// The text of each page searched so far, as search sees it.
+    haystacks: Vec<Option<text::Haystack>>,
     info: Arc<DocInfo>,
     shared: &'s Shared,
     emit: &'s Emit,
-    pages: VecDeque<(u32, PdfPage<'p>)>,
     recent: VecDeque<(TileKey, Instant)>,
     copy: Option<Copy>,
     search: Option<Search>,
@@ -353,14 +388,34 @@ impl<'p> Session<'_, 'p> {
                         break Task::Thumbnail(queue.wanted.thumbnails.remove(0));
                     }
 
-                    let Ok(guard) = self.shared.wake.wait(queue) else {
-                        return Exit::Shutdown;
-                    };
-                    queue = guard;
+                    if self.scratch.is_some() || self.parsed >= RECYCLE_AFTER {
+                        break Task::Tidy;
+                    }
+
+                    // With parsed pages in hand, wait only so long for more
+                    // work on them; without, for as long as it takes.
+                    if self.pages.is_empty() {
+                        let Ok(guard) = self.shared.wake.wait(queue) else {
+                            return Exit::Shutdown;
+                        };
+                        queue = guard;
+                    } else {
+                        let Ok((guard, wait)) = self.shared.wake.wait_timeout(queue, REST_AFTER)
+                        else {
+                            return Exit::Shutdown;
+                        };
+                        queue = guard;
+
+                        if wait.timed_out() {
+                            break Task::Rest;
+                        }
+                    }
                 }
             };
 
             match task {
+                Task::Tidy => self.tidy(),
+                Task::Rest => self.pages.clear(),
                 Task::Tile(key) => self.tile(key),
                 Task::Text(page) => self.text(page),
                 Task::Thumbnail(page) => self.thumbnail(page),
@@ -399,11 +454,56 @@ impl<'p> Session<'_, 'p> {
         } else {
             let page = self.document.pages().get(index as PdfPageIndex).ok()?;
 
+            self.parsed += 1;
             self.pages.push_front((index, page));
             self.pages.truncate(PAGE_CACHE);
         }
 
         self.pages.front().map(|(_, page)| page)
+    }
+
+    /// Lets go of what PDFium has built up, now that nothing is waiting.
+    fn tidy(&mut self) {
+        self.scratch = None;
+
+        if self.parsed < RECYCLE_AFTER {
+            return;
+        }
+
+        self.parsed = 0;
+
+        // Should the file have gone, or been replaced by another, since it
+        // was opened, the handle that has it open carries on.
+        if let Ok(fresh) = self.pdfium.load_pdf_from_file(&self.info.path, None)
+            && fresh.pages().len() as usize == self.info.pages.len()
+        {
+            self.pages.clear();
+            self.document = fresh;
+        }
+    }
+
+    /// Loads a page for a pass over the whole document: from the cache if
+    /// it happens to be there, and otherwise through the scratch handle,
+    /// without keeping it. Caching it would push out the pages on screen.
+    fn with_passing_page<T>(&mut self, index: u32, f: impl FnOnce(&PdfPage) -> T) -> Option<T> {
+        if let Some((_, page)) = self.pages.iter().find(|(page, _)| *page == index) {
+            return Some(f(page));
+        }
+
+        if self.scratch.is_none() {
+            self.scratch = self
+                .pdfium
+                .load_pdf_from_file(&self.info.path, None)
+                .ok()
+                .filter(|scratch| scratch.pages().len() as usize == self.info.pages.len());
+        }
+
+        // The file may have gone since it was opened; the handle that has
+        // it open still works.
+        let document = self.scratch.as_ref().unwrap_or(&self.document);
+        let page = document.pages().get(index as PdfPageIndex).ok()?;
+
+        Some(f(&page))
     }
 
     fn size(&self, page: u32) -> Option<PageSize> {
@@ -476,11 +576,21 @@ impl<'p> Session<'_, 'p> {
             height,
         };
 
-        let Some(page) = self.page(index) else {
-            return;
+        // A thumbnail is all that is wanted of most pages it is asked for,
+        // so the page is not kept for more: see `PAGE_CACHE`.
+        let bitmap = match self.pages.iter().find(|(page, _)| *page == index) {
+            Some((_, page)) => render(page, region),
+            None => {
+                self.parsed += 1;
+                self.document
+                    .pages()
+                    .get(index as PdfPageIndex)
+                    .ok()
+                    .and_then(|page| render(&page, region))
+            }
         };
 
-        if let Some(bitmap) = render(page, region) {
+        if let Some(bitmap) = bitmap {
             (self.emit)(Event::Thumbnail {
                 doc: self.info.id,
                 page: index,
@@ -495,11 +605,20 @@ impl<'p> Session<'_, 'p> {
             .and_then(|page| extract(page, false))
             .unwrap_or_default();
 
+        self.remember(index, &text);
+
         (self.emit)(Event::Text {
             doc: self.info.id,
             page: index,
             text: Arc::new(text),
         });
+    }
+
+    /// Keeps what a search needs of a page's text, for the searches to come.
+    fn remember(&mut self, index: u32, text: &PageText) {
+        if let Some(haystack @ None) = self.haystacks.get_mut(index as usize) {
+            *haystack = Some(text.haystack());
+        }
     }
 
     fn start(&mut self, job: Job) {
@@ -546,7 +665,10 @@ impl<'p> Session<'_, 'p> {
 
         let page = copy.page;
 
-        if let Some(text) = self.page(page).and_then(|page| extract(page, false)) {
+        if let Some(text) = self
+            .with_passing_page(page, |page| extract(page, false))
+            .flatten()
+        {
             let range = text::selected_range(&text, page, &from, &to, granularity);
             let piece = text.text(range);
 
@@ -560,13 +682,28 @@ impl<'p> Session<'_, 'p> {
         self.copy = Some(copy);
     }
 
-    /// Searches one more page.
+    /// Searches on: past the pages known not to hold the query, which cost
+    /// next to nothing, and through one that might.
     fn search_step(&mut self) {
         let Some(mut search) = self.search.take() else {
             return;
         };
 
         let pages = self.info.pages.len() as u32;
+
+        // Bounded, so that a long run of misses cannot hold up a tile.
+        for _ in 0..SEARCH_STRIDE {
+            let ruled_out = search.done < pages
+                && self.haystacks[((search.from + search.done) % pages) as usize]
+                    .as_ref()
+                    .is_some_and(|haystack| !haystack.contains(&search.needle));
+
+            if !ruled_out {
+                break;
+            }
+
+            search.done += 1;
+        }
 
         if search.done >= pages || search.found >= MATCH_LIMIT {
             (self.emit)(Event::SearchDone {
@@ -579,19 +716,22 @@ impl<'p> Session<'_, 'p> {
 
         let index = (search.from + search.done) % pages;
 
-        // A search walks the whole document, so a page it has to load is not
-        // kept: that would push the pages on screen out of the cache.
-        let text = match self.pages.iter().find(|(page, _)| *page == index) {
-            Some((_, page)) => extract(page, false),
-            None => self
-                .document
-                .pages()
-                .get(index as PdfPageIndex)
-                .ok()
-                .and_then(|page| extract(&page, false)),
-        };
+        // Still to be ruled out; the next step takes it from there.
+        if self.haystacks[index as usize]
+            .as_ref()
+            .is_some_and(|haystack| !haystack.contains(&search.needle))
+        {
+            self.search = Some(search);
+            return;
+        }
+
+        let text = self
+            .with_passing_page(index, |page| extract(page, false))
+            .flatten();
 
         if let Some(text) = text {
+            self.remember(index, &text);
+
             let matches: Vec<Match> = text
                 .find(&search.needle)
                 .into_iter()
@@ -640,8 +780,9 @@ impl<'p> Session<'_, 'p> {
                         height: 792.0,
                     });
                     let (text, rules) = self
-                        .page(page)
-                        .map(|page| (extract(page, true).unwrap_or_default(), rules(page)))
+                        .with_passing_page(page, |page| {
+                            (extract(page, true).unwrap_or_default(), rules(page))
+                        })
                         .unwrap_or_default();
 
                     pages.push(markdown::Page::new(&text, size, rules));
