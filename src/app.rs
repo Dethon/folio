@@ -1052,3 +1052,104 @@ pub fn run(options: Options) -> iced::Result {
         })
         .run()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::tests::fixture_path;
+
+    /// Runs updates until `done`, as the engine's wake-ups would.
+    fn settle(app: &mut App, done: impl Fn(&App) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+
+        while !done(app) {
+            assert!(Instant::now() < deadline, "the view never settled");
+
+            std::thread::sleep(Duration::from_millis(2));
+            let _ = app.update(Message::Engine);
+        }
+    }
+
+    #[test]
+    fn shows_a_document_given_at_start_up() {
+        let (mut app, _) = App::boot(Options {
+            file: Some(fixture_path()),
+            page: Some(2),
+            ..Options::default()
+        });
+
+        // There is no window, so no layout: the view is the size assumed.
+        assert_eq!(app.viewer.viewport(), ui::page_view_size(WINDOW, true));
+        assert!(app.opening.is_some());
+
+        settle(&mut app, |app| {
+            app.document().is_some() && app.viewer.is_complete()
+        });
+
+        assert!(app.opening.is_none());
+        assert_eq!(app.title(), "Sample Document — Folio");
+        assert_eq!(app.viewer.current_page(), 1);
+        assert_eq!(app.page_input, "2");
+    }
+
+    #[test]
+    fn opens_another_document_over_the_first() {
+        let (mut app, _) = App::boot(Options {
+            file: Some(fixture_path()),
+            ..Options::default()
+        });
+
+        settle(&mut app, |app| app.document().is_some());
+
+        let first = app.document().map(|doc| doc.id);
+
+        app.viewer.go_to_page(2);
+
+        let _ = app.update(Message::Open(Some(fixture_path())));
+
+        settle(&mut app, |app| {
+            app.document().map(|doc| doc.id) != first && app.viewer.is_complete()
+        });
+
+        // From the top again, and whole.
+        assert_eq!(app.viewer.current_page(), 0);
+        assert!(app.opening.is_none());
+    }
+
+    #[test]
+    fn reports_a_file_it_cannot_open() {
+        let (mut app, _) = App::boot(Options {
+            file: Some(PathBuf::from("no-such-file.pdf")),
+            ..Options::default()
+        });
+
+        settle(&mut app, |app| app.toast.is_some());
+
+        let toast = app.toast.as_ref().unwrap();
+
+        assert_eq!(toast.tone, Tone::Error);
+        assert!(toast.text.starts_with("Could not open no-such-file.pdf."));
+        assert!(app.document().is_none() && app.opening.is_none());
+    }
+
+    #[test]
+    fn finds_as_the_query_is_typed() {
+        let (mut app, _) = App::boot(Options {
+            file: Some(fixture_path()),
+            ..Options::default()
+        });
+
+        settle(&mut app, |app| app.document().is_some());
+
+        let _ = app.update(Message::Find);
+
+        for query in ["p", "pa", "paragraph"] {
+            let _ = app.update(Message::FindInput(query.into()));
+        }
+
+        settle(&mut app, |app| !app.find.searching);
+
+        assert_eq!(app.viewer.match_count(), 2);
+        assert_eq!(app.viewer.current_match(), Some(1));
+    }
+}
