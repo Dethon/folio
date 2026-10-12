@@ -11,7 +11,7 @@ use iced::widget::{
     button, column, container, mouse_area, progress_bar, row, space, stack, text, text_input,
     tooltip,
 };
-use iced::{Center, Element, Fill, Font, Padding, border, font, mouse};
+use iced::{Center, Element, Fill, Font, Padding, Size, border, font, mouse};
 
 use crate::app::{App, Find, Message, Tone};
 use icon::Icon;
@@ -39,11 +39,50 @@ fn strong() -> Font {
     }
 }
 
+/// Lays out a line in each cut of the interface font, which leaves the font
+/// loaded and matched for the first frame to use.
+pub fn warm_fonts() {
+    use iced::advanced::graphics::text::Paragraph;
+    use iced::advanced::text::{self, Paragraph as _};
+
+    for font in [font(), strong()] {
+        let _ = Paragraph::with_text(text::Text {
+            content: "Folio 0123456789",
+            bounds: Size::INFINITE,
+            size: theme::TEXT.into(),
+            line_height: text::LineHeight::default(),
+            font,
+            align_x: text::Alignment::Default,
+            align_y: iced::alignment::Vertical::Top,
+            shaping: text::Shaping::default(),
+            wrapping: text::Wrapping::default(),
+        });
+    }
+}
+
+/// The size the page view is given in a window of the given size: what is
+/// left beside the sidebar and below the toolbar, each with its rule.
+pub fn page_view_size(window: Size, sidebar: bool) -> Size {
+    Size::new(
+        window.width
+            - if sidebar {
+                theme::SIDEBAR_WIDTH + 1.0
+            } else {
+                0.0
+            },
+        window.height - theme::TOOLBAR_HEIGHT - 1.0,
+    )
+}
+
 pub fn view(app: &App) -> Element<'_, Message> {
     let palette = app.palette;
 
     let content: Element<'_, Message> = if app.viewer.document().is_some() {
         viewer::view(&app.viewer, palette, Message::Viewer)
+    } else if app.opening.is_some() {
+        // The document is moments away; an invitation to open one would
+        // only flash by.
+        space().into()
     } else {
         welcome(app)
     };
@@ -440,4 +479,61 @@ fn toast_view<'a>(palette: Palette, toast: &'a crate::app::Toast) -> Element<'a,
         .max_width(520)
         .style(move |_| theme::popover(palette))
         .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use iced::window;
+
+    use super::*;
+    use crate::app::Options;
+    use crate::engine::{DocInfo, PageSize};
+    use crate::ui::viewer::Interaction;
+
+    /// Start-up renders the first screen before there is a window to lay
+    /// out, so what it assumes about the layout has to hold.
+    #[test]
+    fn page_view_size_is_where_the_layout_puts_it() {
+        let window = Size::new(1180.0, 840.0);
+
+        for sidebar in [true, false] {
+            let (mut app, _) = App::boot(Options::default());
+
+            app.sidebar.open = sidebar;
+            app.viewer.set_document(Arc::new(DocInfo {
+                id: 1,
+                path: PathBuf::new(),
+                title: String::new(),
+                pages: vec![
+                    PageSize {
+                        width: 612.0,
+                        height: 792.0,
+                    };
+                    3
+                ],
+                outline: Vec::new(),
+            }));
+
+            let mut ui =
+                iced_test::Simulator::with_size(iced::Settings::default(), window, app.view());
+
+            ui.simulate([iced::Event::Window(window::Event::RedrawRequested(
+                Instant::now(),
+            ))]);
+
+            let sizes: Vec<Size> = ui
+                .into_messages()
+                .filter_map(|message| match message {
+                    Message::Viewer(Interaction::Resized(size)) => Some(size),
+                    _ => None,
+                })
+                .collect();
+
+            assert_eq!(sizes, [page_view_size(window, sidebar)]);
+        }
+    }
 }

@@ -2,6 +2,7 @@
 
 use std::ops::Range;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -16,7 +17,7 @@ use crate::engine::{self, DocInfo, Engine, JobKind, print};
 use crate::trace;
 use crate::ui::theme::Palette;
 use crate::ui::viewer::{Fit, Interaction, Viewer};
-use crate::ui::{self, sidebar};
+use crate::ui::{self, icon, sidebar};
 
 /// Options taken from the command line.
 #[derive(Debug, Clone, Default)]
@@ -39,6 +40,9 @@ pub struct Options {
     /// Development aid: once the first view has rendered, scroll down for
     /// this many frames, report how they went to the trace, and quit.
     pub scroll_test: Option<u32>,
+    /// Device pixels per logical pixel on the display the window is likely
+    /// to open on, when that can be told before there is a window.
+    pub scale_factor: Option<f32>,
 }
 
 /// Carries a value that cannot be cloned through a message, which must be.
@@ -68,7 +72,8 @@ impl<T> std::fmt::Debug for Once<T> {
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    Engine(Once<engine::Event>),
+    /// The engine has events waiting.
+    Engine,
     Viewer(Interaction),
     OpenDialog,
     Open(Option<PathBuf>),
@@ -138,6 +143,10 @@ impl Find {
 
 pub struct App {
     engine: Engine,
+    events: std::sync::mpsc::Receiver<engine::Event>,
+    /// Set by the engine when it adds to `events`; while it is set, a
+    /// [`Message::Engine`] is on its way.
+    pending: Arc<AtomicBool>,
     pub viewer: Viewer,
     pub sidebar: sidebar::State,
     pub palette: Palette,
@@ -151,6 +160,9 @@ pub struct App {
     screenshot_countdown: Option<u8>,
     scroll_test: Option<ScrollTest>,
 }
+
+/// The size the window opens at, in logical pixels.
+const WINDOW: Size = Size::new(1180.0, 840.0);
 
 /// Distance the scroll test moves per frame, in logical pixels.
 const SCROLL_TEST_STEP: f32 = 30.0;
@@ -168,13 +180,29 @@ struct ScrollTest {
 
 impl App {
     pub fn boot(options: Options) -> (Self, Task<Message>) {
-        let (sender, receiver) = mpsc::unbounded();
-        let engine = Engine::spawn(move |event| {
-            let _ = sender.unbounded_send(event);
+        // Events are queued here and taken in a batch; the stream only
+        // carries the news that there are some. A burst of tiles is then one
+        // update of the interface rather than one each.
+        let (sender, events) = std::sync::mpsc::channel();
+        let (waker, woken) = mpsc::unbounded();
+        let pending = Arc::new(AtomicBool::new(false));
+
+        let engine = Engine::spawn({
+            let pending = pending.clone();
+
+            move |event| {
+                let _ = sender.send(event);
+
+                if !pending.swap(true, Ordering::AcqRel) {
+                    let _ = waker.unbounded_send(());
+                }
+            }
         });
 
         let mut app = Self {
             engine,
+            events,
+            pending,
             viewer: Viewer::default(),
             sidebar: sidebar::State::default(),
             palette: if options.light {
@@ -194,13 +222,27 @@ impl App {
 
         trace::mark("boot");
 
+        // The window does not exist yet, but where the page view will be in
+        // it is known. Assuming that much lets the engine render the first
+        // screen while the graphics device is still starting; if the guess
+        // is off, the view corrects it when it is first laid out.
+        if let Some(scale_factor) = app.options.scale_factor {
+            app.viewer.set_scale_factor(scale_factor);
+            icon::set_scale_factor(scale_factor);
+        }
+
+        app.viewer.set_viewport(ui::page_view_size(
+            WINDOW,
+            app.options.sidebar.as_deref() != Some("hidden"),
+        ));
+
         if let Some(path) = app.options.file.clone() {
             app.open(path);
         } else if app.options.screenshot.is_some() {
             app.screenshot_countdown = Some(3);
         }
 
-        let events = Task::stream(receiver.map(|event| Message::Engine(Once::new(event))));
+        let events = Task::stream(woken.map(|()| Message::Engine));
         let scale = window::oldest()
             .and_then(window::scale_factor)
             .map(Message::ScaleFactor);
@@ -244,7 +286,45 @@ impl App {
 
     fn open(&mut self, path: PathBuf) {
         self.opening = Some(path.clone());
-        self.engine.open(path);
+        self.engine.open(path, Some(self.plan()));
+    }
+
+    /// Works out what a document about to be opened will be asked for
+    /// first, by laying it out in a view the shape of this one.
+    fn plan(&self) -> engine::Plan {
+        let mut options = self.options.clone();
+        let viewport = self.viewer.viewport();
+        let scale_factor = self.viewer.scale_factor();
+        let (open, height) = (self.sidebar.open, self.sidebar.height);
+
+        Box::new(move |doc| {
+            let mut viewer = Viewer::default();
+            let mut sidebar = sidebar::State::default();
+
+            viewer.set_scale_factor(scale_factor);
+            viewer.set_viewport(viewport);
+            sidebar.open = open;
+            sidebar.height = height;
+
+            present(&mut viewer, &mut sidebar, &mut options, doc.clone());
+
+            let thumbnails = sidebar_thumbnails(&sidebar, &viewer);
+
+            viewer.wanted(thumbnails)
+        })
+    }
+
+    /// Takes in everything the engine has produced since last asked.
+    fn drain(&mut self) -> Task<Message> {
+        self.pending.store(false, Ordering::Release);
+
+        let mut tasks = Vec::new();
+
+        while let Ok(event) = self.events.try_recv() {
+            tasks.push(self.engine_event(event));
+        }
+
+        Task::batch(tasks)
     }
 
     fn notify(&mut self, text: impl Into<String>, tone: Tone) {
@@ -263,27 +343,24 @@ impl App {
         self.viewer.document()
     }
 
-    /// Pages whose thumbnails the sidebar is showing.
-    fn sidebar_thumbnails(&self) -> Range<u32> {
-        if self.sidebar.open && self.sidebar.tab == sidebar::Tab::Pages {
-            let rows = self.sidebar.visible_rows(self.viewer.page_count() as usize);
-            rows.start as u32..rows.end as u32
-        } else {
-            0..0
-        }
+    fn set_scale_factor(&mut self, scale_factor: f32) {
+        self.viewer.set_scale_factor(scale_factor);
+        icon::set_scale_factor(scale_factor);
     }
 
     /// Tells the engine what the current view is missing. Called after
     /// anything that changes what is on screen.
     fn sync(&mut self) {
-        let wanted = self.viewer.wanted(self.sidebar_thumbnails());
+        let wanted = self
+            .viewer
+            .wanted(sidebar_thumbnails(&self.sidebar, &self.viewer));
 
-        if self.document().is_some() && self.viewer.has_viewport() && wanted.visible == 0 {
+        if self.document().is_some() && self.viewer.has_viewport() && self.viewer.is_complete() {
             trace::mark("view complete");
         }
 
         if let Some(test) = self.scroll_test.as_mut() {
-            test.missing = wanted.visible > 0;
+            test.missing = !self.viewer.is_complete();
         }
 
         let settled = self.opening.is_none()
@@ -311,12 +388,10 @@ impl App {
             });
         }
 
-        self.engine
-            .want(wanted.tiles, wanted.texts, wanted.thumbnails);
-
         let page = self.viewer.current_page();
 
         if let Some(doc) = self.document().cloned() {
+            self.engine.want(doc.id, wanted);
             self.sidebar.follow(Some(&doc), page);
         }
     }
@@ -372,6 +447,7 @@ impl App {
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
         let page_before = self.viewer.current_page();
+        let produced = self.drain();
         let task = self.handle(message);
 
         self.sync();
@@ -380,19 +456,16 @@ impl App {
 
         if page != page_before {
             self.refresh_page_input();
-            return Task::batch([task, self.sidebar.reveal_page(page)]);
+            return Task::batch([produced, task, self.sidebar.reveal_page(page)]);
         }
 
-        task
+        Task::batch([produced, task])
     }
 
     fn handle(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::Engine(event) => {
-                if let Some(event) = event.take() {
-                    return self.engine_event(event);
-                }
-            }
+            // Every update takes in what the engine has produced.
+            Message::Engine => {}
             Message::Viewer(interaction) => match interaction {
                 Interaction::Resized(size) => {
                     // Published while the first frame was being drawn.
@@ -577,12 +650,10 @@ impl App {
             Message::Key(_) => {}
             Message::Window(event) => match event {
                 window::Event::FileDropped(path) => self.open(path),
-                window::Event::Rescaled(scale_factor) => {
-                    self.viewer.set_scale_factor(scale_factor);
-                }
+                window::Event::Rescaled(scale_factor) => self.set_scale_factor(scale_factor),
                 _ => {}
             },
-            Message::ScaleFactor(scale_factor) => self.viewer.set_scale_factor(scale_factor),
+            Message::ScaleFactor(scale_factor) => self.set_scale_factor(scale_factor),
             Message::Tick(now) => {
                 if self
                     .toast
@@ -638,27 +709,8 @@ impl App {
             engine::Event::Opened(doc) => {
                 trace::mark("opened received");
                 self.opening = None;
-                self.sidebar.set_document(&doc);
-                self.viewer.set_document(doc);
 
-                match self.options.sidebar.take().as_deref() {
-                    Some("pages") => self.sidebar.show(sidebar::Tab::Pages),
-                    Some("outline") => self.sidebar.show(sidebar::Tab::Outline),
-                    Some("hidden") => self.sidebar.open = false,
-                    _ => {}
-                }
-
-                if self.options.select_all {
-                    self.viewer.select_all();
-                }
-
-                if let Some(zoom) = self.options.zoom.take() {
-                    self.viewer.zoom_to(zoom, None);
-                }
-
-                if let Some(page) = self.options.page.take() {
-                    self.viewer.go_to_page(page.saturating_sub(1));
-                }
+                present(&mut self.viewer, &mut self.sidebar, &mut self.options, doc);
 
                 self.refresh_page_input();
 
@@ -847,6 +899,47 @@ impl App {
     }
 }
 
+/// Shows a newly loaded document: from the top, or the first time, the way
+/// the command line asked.
+fn present(
+    viewer: &mut Viewer,
+    sidebar: &mut sidebar::State,
+    options: &mut Options,
+    doc: Arc<DocInfo>,
+) {
+    sidebar.set_document(&doc);
+    viewer.set_document(doc);
+
+    match options.sidebar.take().as_deref() {
+        Some("pages") => sidebar.show(sidebar::Tab::Pages),
+        Some("outline") => sidebar.show(sidebar::Tab::Outline),
+        Some("hidden") => sidebar.open = false,
+        _ => {}
+    }
+
+    if options.select_all {
+        viewer.select_all();
+    }
+
+    if let Some(zoom) = options.zoom.take() {
+        viewer.zoom_to(zoom, None);
+    }
+
+    if let Some(page) = options.page.take() {
+        viewer.go_to_page(page.saturating_sub(1));
+    }
+}
+
+/// Pages whose thumbnails the sidebar is showing.
+fn sidebar_thumbnails(sidebar: &sidebar::State, viewer: &Viewer) -> Range<u32> {
+    if sidebar.open && sidebar.tab == sidebar::Tab::Pages {
+        let rows = sidebar.visible_rows(viewer.page_count() as usize);
+        rows.start as u32..rows.end as u32
+    } else {
+        0..0
+    }
+}
+
 /// Escape, whether or not a widget took it: a focused text field does, to
 /// drop its focus, and the key should still close the find bar.
 fn escape(
@@ -873,8 +966,49 @@ fn window_handle(window: &dyn window::Window) -> isize {
     }
 }
 
+/// The default executor starts a thread per core. All that runs on it here
+/// is a timer and the wait for a dialog to close, so one thread will do.
+struct Executor(tokio::runtime::Runtime);
+
+impl iced::Executor for Executor {
+    fn new() -> Result<Self, std::io::Error> {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .map(Self)
+    }
+
+    fn spawn(&self, future: impl Future<Output = ()> + Send + 'static) {
+        drop(self.0.spawn(future));
+    }
+
+    fn block_on<T>(&self, future: impl Future<Output = T>) -> T {
+        self.0.block_on(future)
+    }
+
+    fn enter<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _guard = self.0.enter();
+        f()
+    }
+}
+
+fn window_icon() -> Option<window::Icon> {
+    let icon = image::load_from_memory_with_format(
+        include_bytes!("../assets/icon/folio.png"),
+        image::ImageFormat::Png,
+    )
+    .ok()?
+    .into_rgba8();
+
+    let (width, height) = icon.dimensions();
+
+    window::icon::from_rgba(icon.into_raw(), width, height).ok()
+}
+
 pub fn run(options: Options) -> iced::Result {
     iced::application(move || App::boot(options.clone()), App::update, App::view)
+        .executor::<Executor>()
         .title(App::title)
         .theme(App::theme)
         .subscription(App::subscription)
@@ -884,13 +1018,9 @@ pub fn run(options: Options) -> iced::Result {
             ..iced::Settings::default()
         })
         .window(window::Settings {
-            size: Size::new(1180.0, 840.0),
+            size: WINDOW,
             min_size: Some(Size::new(560.0, 380.0)),
-            icon: window::icon::from_file_data(
-                include_bytes!("../assets/icon/folio.png"),
-                Some(image::ImageFormat::Png),
-            )
-            .ok(),
+            icon: window_icon(),
             ..window::Settings::default()
         })
         .run()

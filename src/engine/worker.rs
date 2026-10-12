@@ -10,8 +10,9 @@ use crate::trace;
 use super::table::Rule;
 use super::text::{self, Glyph, Rect};
 use super::{
-    Bitmap, CopyRequest, DocInfo, Event, Job, JobKind, MATCH_LIMIT, Match, OutlineItem, PageSize,
-    PageText, SearchRequest, Shared, THUMBNAIL_WIDTH, TILE, TileKey, markdown, page_pixels, print,
+    Bitmap, CopyRequest, DocInfo, Event, Job, JobKind, MATCH_LIMIT, Match, Open, OutlineItem,
+    PageSize, PageText, SearchRequest, Shared, THUMBNAIL_WIDTH, TILE, TileKey, Wanted, markdown,
+    page_pixels, print,
 };
 
 type Emit = Box<dyn Fn(Event) + Send>;
@@ -33,7 +34,7 @@ pub(crate) fn run(shared: Arc<Shared>, emit: Emit) {
     trace::mark("engine: pdfium bound");
 
     loop {
-        let Some(path) = next_open(&shared) else {
+        let Some(Open { path, plan }) = next_open(&shared) else {
             return;
         };
 
@@ -63,6 +64,19 @@ pub(crate) fn run(shared: Arc<Shared>, emit: Emit) {
         next_id += 1;
 
         trace::mark("engine: document described");
+
+        // Start on what the UI is expected to ask for, unless it has moved
+        // on to another document already.
+        if let Some(plan) = plan {
+            let wanted = plan(&info);
+
+            if let Ok(mut queue) = shared.queue.lock()
+                && queue.open.is_none()
+            {
+                queue.doc = info.id;
+                queue.wanted = wanted;
+            }
+        }
 
         emit(Event::Opened(info.clone()));
 
@@ -114,7 +128,7 @@ fn load_pdfium() -> Result<Pdfium, String> {
 }
 
 /// Blocks until a document should be opened. `None` means shut down.
-fn next_open(shared: &Shared) -> Option<PathBuf> {
+fn next_open(shared: &Shared) -> Option<Open> {
     let mut queue = shared.queue.lock().ok()?;
 
     loop {
@@ -122,14 +136,12 @@ fn next_open(shared: &Shared) -> Option<PathBuf> {
             return None;
         }
 
-        if let Some(path) = queue.open.take() {
-            return Some(path);
+        if let Some(open) = queue.open.take() {
+            return Some(open);
         }
 
         // Nothing is open, so nothing else in the queue can be served.
-        queue.tiles.clear();
-        queue.texts.clear();
-        queue.thumbnails.clear();
+        queue.wanted = Wanted::default();
         queue.copy = None;
         queue.search = None;
         queue.jobs.clear();
@@ -298,12 +310,17 @@ impl<'p> Session<'_, 'p> {
                         return Exit::Reopen;
                     }
 
-                    if !queue.tiles.is_empty() {
-                        break Task::Tile(queue.tiles.remove(0));
+                    // Left over from a document that has since been replaced.
+                    if queue.doc != self.info.id {
+                        queue.wanted = Wanted::default();
                     }
 
-                    if !queue.texts.is_empty() {
-                        break Task::Text(queue.texts.remove(0));
+                    if !queue.wanted.tiles.is_empty() {
+                        break Task::Tile(queue.wanted.tiles.remove(0));
+                    }
+
+                    if !queue.wanted.texts.is_empty() {
+                        break Task::Text(queue.wanted.texts.remove(0));
                     }
 
                     // A copy is interactive, so it runs ahead of long jobs.
@@ -332,8 +349,8 @@ impl<'p> Session<'_, 'p> {
                         break Task::Start(job);
                     }
 
-                    if !queue.thumbnails.is_empty() {
-                        break Task::Thumbnail(queue.thumbnails.remove(0));
+                    if !queue.wanted.thumbnails.is_empty() {
+                        break Task::Thumbnail(queue.wanted.thumbnails.remove(0));
                     }
 
                     let Ok(guard) = self.shared.wake.wait(queue) else {

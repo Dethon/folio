@@ -24,7 +24,8 @@ use lru::LruCache;
 
 use crate::engine::text::{self, Rect};
 use crate::engine::{
-    Anchor, Bitmap, DocInfo, Granularity, Match, PageSize, PageText, TILE, TileKey, page_pixels,
+    Anchor, Bitmap, DocInfo, Granularity, Match, PageSize, PageText, TILE, TileKey, Wanted,
+    page_pixels,
 };
 use crate::trace;
 use crate::ui::theme::Palette;
@@ -76,16 +77,6 @@ struct Selection {
     granularity: Granularity,
 }
 
-/// What the engine should produce next, most urgent first.
-#[derive(Debug, Default, PartialEq)]
-pub struct Wanted {
-    /// How many of `tiles`, from the front, are in view right now.
-    pub visible: usize,
-    pub tiles: Vec<TileKey>,
-    pub texts: Vec<u32>,
-    pub thumbnails: Vec<u32>,
-}
-
 struct Tile {
     handle: image::Handle,
     bytes: usize,
@@ -120,6 +111,8 @@ pub struct Viewer {
     origin: Anchor,
     /// Sign of the last vertical scroll, to prefetch in that direction.
     heading: f64,
+    /// Tiles in view that had not been rendered when last asked.
+    missing: usize,
 }
 
 impl Default for Viewer {
@@ -144,6 +137,7 @@ impl Default for Viewer {
             current: None,
             origin: Anchor::start_of(0),
             heading: 1.0,
+            missing: 0,
         }
     }
 }
@@ -186,9 +180,25 @@ impl Viewer {
         }
     }
 
-    /// Whether the widget has been laid out yet.
+    /// Whether the size of the view is known yet.
     pub fn has_viewport(&self) -> bool {
         self.viewport.height > 0.0
+    }
+
+    pub fn viewport(&self) -> Size {
+        self.viewport
+    }
+
+    pub fn scale_factor(&self) -> f32 {
+        self.scale_factor
+    }
+
+    /// Whether every tile in view had been rendered when [`wanted`] was last
+    /// called.
+    ///
+    /// [`wanted`]: Self::wanted
+    pub fn is_complete(&self) -> bool {
+        self.missing == 0
     }
 
     pub fn page_count(&self) -> u32 {
@@ -542,6 +552,8 @@ impl Viewer {
     pub fn wanted(&mut self, sidebar_thumbnails: Range<u32>) -> Wanted {
         let mut wanted = Wanted::default();
 
+        self.missing = 0;
+
         if self.doc.is_none() || self.viewport.height <= 0.0 {
             return wanted;
         }
@@ -592,7 +604,7 @@ impl Viewer {
 
         tiles.sort_by(|a, b| a.0.total_cmp(&b.0));
         wanted.tiles.extend(tiles.drain(..).map(|(_, key)| key));
-        wanted.visible = wanted.tiles.len();
+        self.missing = wanted.tiles.len();
 
         let visible = self.visible_pages();
 

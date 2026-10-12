@@ -73,9 +73,26 @@ fn main() -> iced::Result {
         }
     }
 
+    options.scale_factor = display_scale_factor();
+
     select_graphics_backend();
+    discover_fonts();
 
     app::run(options)
+}
+
+/// The text renderer reads the name of every installed font the first time
+/// anything is laid out, then picks out and loads the ones the interface is
+/// set in, all of which holds up the first frame. Have that done on another
+/// thread while the main one is starting the graphics device.
+fn discover_fonts() {
+    let _ = std::thread::Builder::new().name("fonts".into()).spawn(|| {
+        let _ = iced::advanced::graphics::text::font_system();
+        trace::mark("fonts discovered");
+
+        ui::warm_fonts();
+        trace::mark("fonts loaded");
+    });
 }
 
 /// A release build is a GUI program on Windows and starts without a
@@ -111,6 +128,29 @@ fn select_graphics_backend() {
     }
 }
 
+/// Device pixels per logical pixel on the main display, where a new window
+/// usually opens.
+fn display_scale_factor() -> Option<f32> {
+    #[cfg(windows)]
+    {
+        use windows::Win32::UI::HiDpi::{
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem,
+            SetProcessDpiAwarenessContext,
+        };
+
+        // The windowing library asks for the same awareness when it starts;
+        // until someone has, Windows reports 96 dpi whatever the display.
+        unsafe {
+            let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+            Some(GetDpiForSystem() as f32 / 96.0)
+        }
+    }
+
+    #[cfg(not(windows))]
+    None
+}
+
 /// Converts a document to Markdown without opening a window.
 fn export(input: PathBuf, output: PathBuf) -> i32 {
     let (sender, receiver) = mpsc::channel();
@@ -118,7 +158,7 @@ fn export(input: PathBuf, output: PathBuf) -> i32 {
         let _ = sender.send(event);
     });
 
-    engine.open(input);
+    engine.open(input, None);
 
     for event in receiver {
         match event {

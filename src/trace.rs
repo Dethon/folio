@@ -2,7 +2,8 @@
 //!
 //! Set `FOLIO_TRACE` to a file path and every [`mark`] is appended to it as
 //! `<milliseconds since the process was created> <label>`. Unset, a mark is
-//! one atomic load.
+//! one atomic load. Setting `FOLIO_TRACE_LOG` as well adds what the windowing
+//! and graphics libraries log, at some cost to the timings.
 
 use std::collections::HashSet;
 use std::fs::File;
@@ -45,8 +46,10 @@ pub fn init() {
 
     mark("main");
 
-    // What the windowing and graphics libraries say they are doing.
-    if log::set_logger(&Logger).is_ok() {
+    // What the windowing and graphics libraries say they are doing. Asked
+    // for separately, because the renderer does extra work when it has a
+    // listener: it probes the graphics adapters a second time to list them.
+    if std::env::var_os("FOLIO_TRACE_LOG").is_some() && log::set_logger(&Logger).is_ok() {
         log::set_max_level(log::LevelFilter::Debug);
     }
 }

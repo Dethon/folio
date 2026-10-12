@@ -157,6 +157,24 @@ pub enum Event {
     },
 }
 
+/// Content the UI is missing, most urgent first.
+#[derive(Debug, Default, PartialEq)]
+pub struct Wanted {
+    pub tiles: Vec<TileKey>,
+    pub texts: Vec<u32>,
+    pub thumbnails: Vec<u32>,
+}
+
+/// Says what a document will be asked for first, given its description. The
+/// worker runs it as soon as the document is loaded and starts on the
+/// answer, without waiting to hear from the UI.
+pub type Plan = Box<dyn FnOnce(&Arc<DocInfo>) -> Wanted + Send>;
+
+pub(crate) struct Open {
+    pub path: PathBuf,
+    pub plan: Option<Plan>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CopyRequest {
     pub from: Anchor,
@@ -177,10 +195,10 @@ pub(crate) enum Job {
 
 #[derive(Default)]
 pub(crate) struct Queue {
-    pub open: Option<PathBuf>,
-    pub tiles: Vec<TileKey>,
-    pub texts: Vec<u32>,
-    pub thumbnails: Vec<u32>,
+    pub open: Option<Open>,
+    /// The document `wanted` was drawn up for.
+    pub doc: u64,
+    pub wanted: Wanted,
     pub copy: Option<CopyRequest>,
     pub search: Option<SearchRequest>,
     pub jobs: VecDeque<Job>,
@@ -241,24 +259,23 @@ impl Engine {
     }
 
     /// Opens a document, replacing the current one and cancelling its work.
-    pub fn open(&self, path: PathBuf) {
+    /// With a `plan`, rendering starts before [`Event::Opened`] is answered.
+    pub fn open(&self, path: PathBuf, plan: Option<Plan>) {
         self.with_queue(|queue| {
-            queue.open = Some(path);
-            queue.tiles.clear();
-            queue.texts.clear();
-            queue.thumbnails.clear();
+            queue.open = Some(Open { path, plan });
+            queue.wanted = Wanted::default();
             queue.copy = None;
             queue.search = None;
             queue.jobs.clear();
         });
     }
 
-    /// Replaces the set of content the UI is missing, most urgent first.
-    pub fn want(&self, tiles: Vec<TileKey>, texts: Vec<u32>, thumbnails: Vec<u32>) {
+    /// Replaces the set of content the UI is missing from document `doc`.
+    /// Ignored if that is no longer the document open.
+    pub fn want(&self, doc: u64, wanted: Wanted) {
         self.with_queue(|queue| {
-            queue.tiles = tiles;
-            queue.texts = texts;
-            queue.thumbnails = thumbnails;
+            queue.doc = doc;
+            queue.wanted = wanted;
         });
     }
 
@@ -306,6 +323,10 @@ pub(crate) mod tests {
     }
 
     impl Fixture {
+        pub fn want(&self, wanted: Wanted) {
+            self.engine.want(self.doc.id, wanted);
+        }
+
         /// Waits for the first event `pick` accepts.
         pub fn wait<T>(&self, mut pick: impl FnMut(Event) -> Option<T>) -> T {
             loop {
@@ -348,7 +369,7 @@ pub(crate) mod tests {
             let _ = sender.send(event);
         });
 
-        engine.open(fixture_path());
+        engine.open(fixture_path(), None);
 
         let mut fixture = Fixture {
             engine,
@@ -412,7 +433,10 @@ pub(crate) mod tests {
         };
         let title = TileKey { col: 0, ..corner };
 
-        fixture.engine.want(vec![title, corner], vec![], vec![]);
+        fixture.want(Wanted {
+            tiles: vec![title, corner],
+            ..Wanted::default()
+        });
 
         let mut seen = Vec::new();
 
@@ -441,7 +465,10 @@ pub(crate) mod tests {
     fn renders_thumbnails() {
         let fixture = open_fixture();
 
-        fixture.engine.want(vec![], vec![], vec![1]);
+        fixture.want(Wanted {
+            thumbnails: vec![1],
+            ..Wanted::default()
+        });
 
         let (page, bitmap) = fixture.wait(|event| match event {
             Event::Thumbnail { page, bitmap, .. } => Some((page, bitmap)),
@@ -457,10 +484,72 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn starts_on_the_plan_before_being_asked() {
+        let (sender, events) = mpsc::channel();
+        let engine = Engine::spawn(move |event| {
+            let _ = sender.send(event);
+        });
+
+        engine.open(
+            fixture_path(),
+            Some(Box::new(|doc| {
+                assert_eq!(doc.pages.len(), 3);
+
+                Wanted {
+                    thumbnails: vec![2],
+                    ..Wanted::default()
+                }
+            })),
+        );
+
+        let mut opened = false;
+
+        // Nothing else is asked of the engine, and the thumbnail still comes.
+        loop {
+            match events.recv_timeout(Duration::from_secs(20)) {
+                Ok(Event::Opened(_)) => opened = true,
+                Ok(Event::Thumbnail { page, .. }) => {
+                    assert_eq!(page, 2);
+                    break;
+                }
+                other => panic!("expected the planned thumbnail, got {other:?}"),
+            }
+        }
+
+        assert!(opened);
+    }
+
+    #[test]
+    fn ignores_what_was_wanted_of_another_document() {
+        let fixture = open_fixture();
+
+        fixture.engine.want(
+            fixture.doc.id + 1,
+            Wanted {
+                thumbnails: vec![0],
+                ..Wanted::default()
+            },
+        );
+        fixture.want(Wanted {
+            texts: vec![1],
+            ..Wanted::default()
+        });
+
+        // Had the first request been served, its thumbnail would come first.
+        match fixture.events.recv_timeout(Duration::from_secs(20)) {
+            Ok(Event::Text { page: 1, .. }) => {}
+            other => panic!("expected the text of page 2, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn extracts_text_in_view_space() {
         let fixture = open_fixture();
 
-        fixture.engine.want(vec![], vec![0], vec![]);
+        fixture.want(Wanted {
+            texts: vec![0],
+            ..Wanted::default()
+        });
 
         let text = fixture.wait(|event| match event {
             Event::Text { page: 0, text, .. } => Some(text),
@@ -484,7 +573,10 @@ pub(crate) mod tests {
     fn copies_a_selection_across_pages() {
         let fixture = open_fixture();
 
-        fixture.engine.want(vec![], vec![0], vec![]);
+        fixture.want(Wanted {
+            texts: vec![0],
+            ..Wanted::default()
+        });
 
         let text = fixture.wait(|event| match event {
             Event::Text { page: 0, text, .. } => Some(text),
@@ -656,7 +748,7 @@ pub(crate) mod tests {
         let path = std::env::temp_dir().join(format!("folio-not-a-pdf-{}.txt", std::process::id()));
         std::fs::write(&path, "plain text").expect("write file");
 
-        engine.open(path);
+        engine.open(path, None);
 
         match events.recv_timeout(Duration::from_secs(20)) {
             Ok(Event::OpenFailed { error, .. }) => assert!(error.contains("not a valid PDF")),
