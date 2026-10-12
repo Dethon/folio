@@ -159,6 +159,8 @@ pub struct App {
     /// Frames to wait before taking the requested screenshot.
     screenshot_countdown: Option<u8>,
     scroll_test: Option<ScrollTest>,
+    /// When the scroll test finished scrolling.
+    resting_since: Option<Instant>,
 }
 
 /// The size the window opens at, in logical pixels.
@@ -166,6 +168,10 @@ const WINDOW: Size = Size::new(1180.0, 840.0);
 
 /// Distance the scroll test moves per frame, in logical pixels.
 const SCROLL_TEST_STEP: f32 = 30.0;
+
+/// How long the scroll test waits after scrolling before it reports the
+/// memory in use at rest.
+const SCROLL_TEST_REST: Duration = Duration::from_secs(5);
 
 /// A scroll test in progress.
 struct ScrollTest {
@@ -218,6 +224,7 @@ impl App {
             options,
             screenshot_countdown: None,
             scroll_test: None,
+            resting_since: None,
         };
 
         trace::mark("boot");
@@ -268,7 +275,10 @@ impl App {
             window::events().map(|(_, event)| Message::Window(event)),
         ];
 
-        if self.toast.is_some() || self.screenshot_countdown.is_some() {
+        if self.toast.is_some()
+            || self.screenshot_countdown.is_some()
+            || self.resting_since.is_some()
+        {
             subscriptions.push(iced::time::every(Duration::from_millis(200)).map(Message::Tick));
         }
 
@@ -665,10 +675,19 @@ impl App {
                     self.toast = None;
                 }
 
+                if self
+                    .resting_since
+                    .is_some_and(|since| now.duration_since(since) >= SCROLL_TEST_REST)
+                {
+                    trace::memory("at rest");
+                    return iced::exit();
+                }
+
                 match self.screenshot_countdown {
                     Some(0) => {
                         self.screenshot_countdown = Some(u8::MAX);
                         trace::memory("settled");
+                        trace::note(|| self.viewer.cache_report());
 
                         return window::oldest()
                             .and_then(window::screenshot)
@@ -855,8 +874,14 @@ impl App {
             )
         });
         trace::memory("after scrolling");
+        trace::note(|| self.viewer.cache_report());
 
-        iced::exit()
+        // Stay a while, to see what is still held once things have settled.
+        self.scroll_test = None;
+        self.options.scroll_test = None;
+        self.resting_since = Some(Instant::now());
+
+        Task::none()
     }
 
     fn key_pressed(&mut self, key: Key, modifiers: keyboard::Modifiers) -> Task<Message> {

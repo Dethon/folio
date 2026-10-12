@@ -113,18 +113,22 @@ pub fn note(line: impl FnOnce() -> String) {
 /// Records the memory the process is using.
 pub fn memory(label: &str) {
     with(|state| {
-        let usage = platform::usage();
-        let mib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
-
-        let _ = writeln!(
-            state.file,
-            "          memory[{label}]: working set {:.1} MiB, peak {:.1} MiB, private {:.1} MiB, {} threads",
-            mib(usage.working_set),
-            mib(usage.peak_working_set),
-            mib(usage.private),
-            usage.threads,
-        );
+        let _ = writeln!(state.file, "          {}", usage_line(label));
     });
+}
+
+/// The memory the process is using, in a line.
+pub fn usage_line(label: &str) -> String {
+    let usage = platform::usage();
+    let mib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
+
+    format!(
+        "memory[{label}]: working set {:.1} MiB, peak {:.1} MiB, private {:.1} MiB, {} threads",
+        mib(usage.working_set),
+        mib(usage.peak_working_set),
+        mib(usage.private),
+        usage.threads,
+    )
 }
 
 #[derive(Default)]

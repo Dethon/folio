@@ -2,6 +2,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
+mod bench;
 mod engine;
 mod trace;
 mod ui;
@@ -62,10 +63,15 @@ fn main() -> iced::Result {
             "--print" => options.print = true,
             // Undocumented development aids: start with everything selected;
             // start with a search made; render one frame to a PNG and exit;
-            // scroll through the document for a number of frames and exit.
+            // scroll through the document for a number of frames and exit;
+            // time the engine on a document, without a window.
             "--select-all" => options.select_all = true,
             "--find" => options.find = args.next(),
             "--screenshot" => options.screenshot = args.next().map(PathBuf::from),
+            "--bench" => match args.next() {
+                Some(input) => std::process::exit(bench::run(input.into())),
+                None => std::process::exit(2),
+            },
             "--scroll-test" => {
                 options.scroll_test = args.next().and_then(|value| value.parse().ok());
             }
@@ -103,9 +109,12 @@ fn attach_console() {
     {
         use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
 
-        let prints = std::env::args()
-            .skip(1)
-            .any(|arg| matches!(arg.as_str(), "-h" | "--help" | "--export-markdown"));
+        let prints = std::env::args().skip(1).any(|arg| {
+            matches!(
+                arg.as_str(),
+                "-h" | "--help" | "--export-markdown" | "--bench"
+            )
+        });
 
         if prints {
             // Fails harmlessly when there is no parent console, or when
