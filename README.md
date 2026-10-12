@@ -111,9 +111,9 @@ However it is shipped, `folio.exe` and `pdfium.dll` must stay together.
   100 %. PDFium renders straight into the buffer that is handed to the GPU.
 - **Virtualised everything.** The page stack, the outline and the thumbnail
   list only build what is on screen; cost does not grow with document length.
-- **Bounded memory.** Rendered tiles are kept for six screenfuls of page, so
-  a small window holds 16 MB of them where a large one needs more; text
-  layers and thumbnails live in small LRUs.
+- **Bounded memory.** Rendered tiles are kept for the view, its prefetch, and
+  half as much again for scrolling back: some twenty megabytes in a window of
+  ordinary size. Text layers and thumbnails live in small LRUs.
   The file is read on demand, never loaded whole. PDFium itself keeps
   everything it has parsed for as long as a document is open, so no handle on
   the document is kept for long: searches and exports run through one of
@@ -142,7 +142,7 @@ Measured on Windows 11 (Ryzen 9 9950X3D, RTX 4090, 240 Hz display) with a
 | Later searches | 6 ms for a phrase that is not there, 47 ms for a word found 174 times, 0.27 s for one on nearly every page |
 | Markdown export of all 501 pages | 0.42 s |
 | Memory with the book open | 120 MB working set, 98 MB of it the window and the graphics driver |
-| Memory after scrolling through 40 pages | 138 MB |
+| Memory after scrolling through 40 pages | 140 MB |
 | Memory of the engine alone, after searching the whole book | 18 MB |
 | Threads | 23 |
 | CPU while idle | 0 |

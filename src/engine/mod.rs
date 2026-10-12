@@ -163,6 +163,10 @@ pub enum Event {
 /// Content the UI is missing, most urgent first.
 #[derive(Debug, Default, PartialEq)]
 pub struct Wanted {
+    /// How many tiles of the document the UI had taken in when it drew this
+    /// up. A tile sent since then is on its way and is not rendered again;
+    /// one sent before and wanted all the same has been dropped, and is.
+    pub received: u64,
     pub tiles: Vec<TileKey>,
     pub texts: Vec<u32>,
     pub thumbnails: Vec<u32>,
@@ -462,6 +466,50 @@ pub(crate) mod tests {
 
             seen.push(key);
         }
+    }
+
+    #[test]
+    fn renders_a_tile_again_only_once_it_is_known_to_have_arrived() {
+        let fixture = open_fixture();
+        let key = TileKey {
+            page: 0,
+            scale: 1.0f32.to_bits(),
+            col: 0,
+            row: 0,
+        };
+        // Whether asking for the tile, of a UI that has taken in `received`
+        // of them, has it rendered. The text is asked for along with it
+        // because it always answers, and after any tile.
+        let ask = |received| {
+            let mut rendered = false;
+
+            fixture.want(Wanted {
+                received,
+                tiles: vec![key],
+                texts: vec![0],
+                ..Wanted::default()
+            });
+
+            fixture.wait(|event| match event {
+                Event::Tile { .. } => {
+                    rendered = true;
+                    None
+                }
+                Event::Text { .. } => Some(()),
+                _ => None,
+            });
+
+            rendered
+        };
+
+        assert!(ask(0), "rendered the first time");
+
+        // Asked for by a UI that has not seen it yet: it is on its way.
+        assert!(!ask(0), "not rendered while in flight");
+
+        // The UI has had it, and wants it still: it let go of it.
+        assert!(ask(1), "rendered again once dropped");
+        assert!(!ask(1), "and is on its way again");
     }
 
     #[test]

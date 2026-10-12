@@ -44,12 +44,10 @@ const ZOOM_STEPS: [f32; 17] = [
     0.1, 0.25, 0.33, 0.5, 0.67, 0.75, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 3.0, 4.0, 6.0, 8.0,
 ];
 
-/// Rendered tiles are kept for this many screenfuls of page. A view and what
-/// is prefetched around it come to two and a half; the rest is what can be
-/// scrolled back to without rendering it again.
-const TILE_SCREENS: usize = 6;
-/// Bounds on the memory that comes to, for windows very small and very large.
-const TILE_BUDGET: std::ops::RangeInclusive<usize> = 16 * 1024 * 1024..=256 * 1024 * 1024;
+/// Rendered tiles are kept beyond the ones the view and its prefetch need,
+/// for scrolling back to without rendering them again: half as much again,
+/// within these bounds.
+const TILE_SPARE: std::ops::RangeInclusive<usize> = 8 * 1024 * 1024..=64 * 1024 * 1024;
 const TEXT_CACHE: usize = 48;
 /// Thumbnails kept beyond those the sidebar is showing: the ones standing in
 /// for pages in view, and a few the sidebar has just scrolled past.
@@ -119,6 +117,11 @@ pub struct Viewer {
     heading: f64,
     /// Tiles in view that had not been rendered when last asked.
     missing: usize,
+    /// Bytes of the tiles the view and its prefetch called for when last
+    /// asked, rendered or not.
+    needed: usize,
+    /// Tiles of this document taken in so far: see [`Wanted::received`].
+    received: u64,
 }
 
 impl Default for Viewer {
@@ -144,6 +147,8 @@ impl Default for Viewer {
             origin: Anchor::start_of(0),
             heading: 1.0,
             missing: 0,
+            needed: 0,
+            received: 0,
         }
     }
 }
@@ -168,6 +173,7 @@ impl Viewer {
         self.doc = Some(doc);
         self.tiles.clear();
         self.tile_bytes = 0;
+        self.received = 0;
         self.stale_scale = None;
         self.thumbnails.clear();
         self.texts.clear();
@@ -556,9 +562,13 @@ impl Viewer {
     /// tiles nearest the centre, then text, then a screenful of prefetch in
     /// the direction of travel.
     pub fn wanted(&mut self, sidebar_thumbnails: Range<u32>) -> Wanted {
-        let mut wanted = Wanted::default();
+        let mut wanted = Wanted {
+            received: self.received,
+            ..Wanted::default()
+        };
 
         self.missing = 0;
+        self.needed = 0;
 
         if self.doc.is_none() || self.viewport.height <= 0.0 {
             return wanted;
@@ -590,12 +600,16 @@ impl Viewer {
                             };
 
                             // `get` also marks the tile as recently used.
-                            if viewer.tiles.get(&key).is_none() {
+                            if let Some(tile) = viewer.tiles.get(&key) {
+                                viewer.needed += tile.bytes;
+                            } else {
                                 let y = page_top
                                     + (row as f64 + 0.5) * TILE as f64 / viewer.scale_factor as f64;
 
                                 tiles.push(((y - centre).abs(), key));
                                 missing = true;
+                                // As large as a tile gets.
+                                viewer.needed += (TILE * TILE * 4) as usize;
                             }
                         }
                     }
@@ -661,16 +675,18 @@ impl Viewer {
         wanted
     }
 
-    /// Bytes of rendered tiles to keep: [`TILE_SCREENS`] times the pixels of
-    /// the view.
+    /// Bytes of rendered tiles to keep: those the view and its prefetch
+    /// need, however many that is, and a share of that again to spare. The
+    /// budget must never be less than what is needed: a tile dropped while
+    /// it was still wanted would be rendered again, only to push out
+    /// another.
     fn tile_budget(&self) -> usize {
-        let scale = self.scale_factor as f64;
-        let pixels = (self.viewport.width as f64 * scale) * (self.viewport.height as f64 * scale);
-
-        (pixels as usize * 4 * TILE_SCREENS).clamp(*TILE_BUDGET.start(), *TILE_BUDGET.end())
+        self.needed + (self.needed / 2).clamp(*TILE_SPARE.start(), *TILE_SPARE.end())
     }
 
     pub fn insert_tile(&mut self, key: TileKey, bitmap: Bitmap) {
+        self.received += 1;
+
         let bytes = bitmap.rgba.len();
         let handle = image::Handle::from_rgba(bitmap.width, bitmap.height, bitmap.rgba);
 
@@ -1471,6 +1487,10 @@ mod tests {
     };
 
     fn viewer(pages: usize) -> Viewer {
+        viewer_of(LETTER, pages)
+    }
+
+    fn viewer_of(page: PageSize, pages: usize) -> Viewer {
         let mut viewer = Viewer::default();
 
         viewer.set_viewport(Size::new(800.0, 600.0));
@@ -1478,7 +1498,7 @@ mod tests {
             id: 1,
             path: PathBuf::new(),
             title: String::new(),
-            pages: vec![LETTER; pages],
+            pages: vec![page; pages],
             outline: Vec::new(),
         }));
         viewer
@@ -1585,6 +1605,69 @@ mod tests {
         let remaining = viewer.wanted(0..0);
 
         assert!(visible.iter().all(|key| !remaining.tiles.contains(key)));
+    }
+
+    /// Plays the engine: renders whatever is wanted, until nothing is.
+    fn render_until_complete(viewer: &mut Viewer) -> usize {
+        for round in 0..8 {
+            let wanted = viewer.wanted(0..0);
+
+            if wanted.tiles.is_empty() {
+                return round;
+            }
+
+            for key in wanted.tiles {
+                let (width, height) = page_pixels(viewer.size(key.page), key.scale());
+                let width = TILE.min(width - key.col as u32 * TILE);
+                let height = TILE.min(height - key.row as u32 * TILE);
+
+                viewer.insert_tile(
+                    key,
+                    Bitmap {
+                        width,
+                        height,
+                        rgba: vec![255; (width * height * 4) as usize],
+                    },
+                );
+            }
+        }
+
+        panic!("the view never had all its tiles");
+    }
+
+    #[test]
+    fn keeps_every_tile_the_view_needs_however_far_in() {
+        const A4: PageSize = PageSize {
+            width: 595.0,
+            height: 842.0,
+        };
+
+        // Zoomed in, a view takes many more tiles than it has pixels for:
+        // each is whole, however little of it shows. An A4 page at 300 % in
+        // a window of the default size once needed more than was kept.
+        for (page, size) in [(LETTER, (800.0, 600.0)), (A4, (915.0, 795.0))] {
+            for zoom in [0.1, 1.0, 3.0, MAX_ZOOM] {
+                let mut viewer = viewer_of(page, 40);
+
+                viewer.set_viewport(Size::new(size.0, size.1));
+                viewer.zoom_to(zoom, None);
+                viewer.go_to_page(20);
+
+                assert_eq!(render_until_complete(&mut viewer), 1, "{size:?} at {zoom}");
+                assert!(viewer.is_complete());
+
+                // Wherever the view comes to rest against the grid of
+                // tiles, what it needs stays once rendered.
+                for _ in 0..28 {
+                    viewer.scroll_by(0.0, 170.0);
+
+                    assert!(
+                        render_until_complete(&mut viewer) <= 1,
+                        "{size:?} at {zoom}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

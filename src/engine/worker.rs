@@ -1,7 +1,6 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
 
 use pdfium_render::prelude::*;
 
@@ -22,10 +21,6 @@ type Emit = Box<dyn Fn(Event) + Send>;
 /// than the pages around the view, though: a parsed page holds every image
 /// on it decoded, which runs to megabytes each.
 const PAGE_CACHE: usize = 4;
-
-/// A tile finished this recently is not rendered again: the UI may have
-/// asked for it once more before our result reached it.
-const RECENT_WINDOW: Duration = Duration::from_millis(300);
 
 const OUTLINE_LIMIT: usize = 20_000;
 
@@ -99,7 +94,8 @@ pub(crate) fn run(shared: Arc<Shared>, emit: Emit) {
             info,
             shared: &shared,
             emit: &emit,
-            recent: VecDeque::new(),
+            sent: VecDeque::new(),
+            tiles_sent: 0,
             copy: None,
             search: None,
             job: None,
@@ -252,7 +248,8 @@ enum Exit {
 enum Task {
     /// Nothing is left to do: let go of what the work needed.
     Tidy,
-    Tile(TileKey),
+    /// A tile, and how many the UI had taken in when it asked.
+    Tile(TileKey, u64),
     Text(u32),
     Thumbnail(u32),
     Copy(CopyRequest),
@@ -316,7 +313,10 @@ struct Session<'s, 'p> {
     info: Arc<DocInfo>,
     shared: &'s Shared,
     emit: &'s Emit,
-    recent: VecDeque<(TileKey, Instant)>,
+    /// Tiles sent that the UI is not known to have taken in yet, each with
+    /// its place in the count of all sent. See [`Wanted::received`].
+    sent: VecDeque<(TileKey, u64)>,
+    tiles_sent: u64,
     copy: Option<Copy>,
     search: Option<Search>,
     job: Option<Active>,
@@ -345,7 +345,7 @@ impl<'p> Session<'_, 'p> {
                     }
 
                     if !queue.wanted.tiles.is_empty() {
-                        break Task::Tile(queue.wanted.tiles.remove(0));
+                        break Task::Tile(queue.wanted.tiles.remove(0), queue.wanted.received);
                     }
 
                     if !queue.wanted.texts.is_empty() {
@@ -395,7 +395,7 @@ impl<'p> Session<'_, 'p> {
 
             match task {
                 Task::Tidy => self.tidy(),
-                Task::Tile(key) => self.tile(key),
+                Task::Tile(key, received) => self.tile(key, received),
                 Task::Text(page) => self.text(page),
                 Task::Thumbnail(page) => self.thumbnail(page),
                 Task::Copy(request) => {
@@ -489,13 +489,18 @@ impl<'p> Session<'_, 'p> {
         self.info.pages.get(page as usize).copied()
     }
 
-    fn tile(&mut self, key: TileKey) {
-        let now = Instant::now();
+    fn tile(&mut self, key: TileKey, received: u64) {
+        // What the UI had by the time it asked is no longer on its way; if
+        // it asks for any of that, it has let go of it since.
+        while self
+            .sent
+            .front()
+            .is_some_and(|(_, place)| *place <= received)
+        {
+            self.sent.pop_front();
+        }
 
-        self.recent
-            .retain(|(_, at)| now.duration_since(*at) < RECENT_WINDOW);
-
-        if self.recent.iter().any(|(recent, _)| *recent == key) {
+        if self.sent.iter().any(|(sent, _)| *sent == key) {
             return;
         }
 
@@ -526,7 +531,8 @@ impl<'p> Session<'_, 'p> {
 
         if let Some(bitmap) = render(page, region) {
             trace::mark("engine: first tile rendered");
-            self.recent.push_back((key, Instant::now()));
+            self.tiles_sent += 1;
+            self.sent.push_back((key, self.tiles_sent));
 
             (self.emit)(Event::Tile {
                 doc: self.info.id,
