@@ -7,6 +7,7 @@ mod engine;
 mod graphics;
 mod trace;
 mod ui;
+mod web;
 
 use std::path::PathBuf;
 use std::sync::mpsc;

@@ -24,7 +24,7 @@ use lru::LruCache;
 
 use crate::engine::text::{self, Rect};
 use crate::engine::{
-    Anchor, Bitmap, DocInfo, Granularity, Match, PageSize, PageText, TILE, TileKey, Wanted,
+    Anchor, Bitmap, DocInfo, Granularity, Link, Match, PageSize, PageText, TILE, TileKey, Wanted,
     page_pixels,
 };
 use crate::trace;
@@ -58,6 +58,9 @@ const SCROLLBAR_INSET: f32 = 3.0;
 const SCROLLBAR_MIN: f32 = 36.0;
 /// Distance a mouse wheel notch scrolls.
 const WHEEL_LINE: f32 = 56.0;
+/// How far the cursor may stray between press and release for the two to
+/// count as a click.
+const CLICK_SLACK: f32 = 4.0;
 
 /// How close to the viewport's edges a search match may sit before the view
 /// moves to show it. The top allows for the find bar floating there.
@@ -381,14 +384,21 @@ impl Viewer {
     }
 
     pub fn go_to_page(&mut self, page: u32) {
+        self.go_to(page, None);
+    }
+
+    /// Brings a place on a page, `top` points down it, to the top of the
+    /// view; the top of the page itself, without one.
+    pub fn go_to(&mut self, page: u32, top: Option<f32>) {
         if self.page_count() == 0 {
             return;
         }
 
         let page = page.min(self.page_count() - 1);
+        let down = top.map_or(0.0, |top| top.clamp(0.0, self.size(page).height) as f64);
 
         // Leave the gap above the page in view, so it reads as a page top.
-        self.scroll_y = self.page_top(page) - GAP.min(MARGIN) as f64;
+        self.scroll_y = self.page_top(page) + down * self.ppp() - GAP.min(MARGIN) as f64;
         self.clamp();
     }
 
@@ -764,6 +774,13 @@ impl Viewer {
         })
     }
 
+    /// The link under a viewport position, once the page's text has come.
+    pub fn link_at(&self, point: Point) -> Option<&Link> {
+        let anchor = self.locate(point)?;
+
+        self.texts.peek(&anchor.page)?.link_at(anchor.x, anchor.y)
+    }
+
     pub fn press(&mut self, point: Point, granularity: Granularity, extend: bool) {
         let Some(anchor) = self.locate(point) else {
             return;
@@ -1053,6 +1070,13 @@ pub enum Interaction {
         at: Point,
     },
     Released,
+    /// Pressed and released in one place, once: after the [`Released`] of
+    /// the same press.
+    ///
+    /// [`Released`]: Self::Released
+    Clicked {
+        at: Point,
+    },
     ScrolledTo {
         fraction: f32,
     },
@@ -1080,11 +1104,13 @@ struct View<'a, Message> {
 enum Drag {
     #[default]
     None,
-    Select,
-    /// Dragging the scrollbar thumb, grabbed this far below its top.
-    Scrollbar {
-        grab: f32,
+    Select {
+        /// Where the press fell, while a release would still make a click
+        /// of it.
+        click: Option<Point>,
     },
+    /// Dragging the scrollbar thumb, grabbed this far below its top.
+    Scrollbar { grab: f32 },
 }
 
 #[derive(Default)]
@@ -1210,7 +1236,11 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for View<'_, Message>
                             click::Click::new(position, mouse::Button::Left, state.last_click);
 
                         state.last_click = Some(click);
-                        state.drag = Drag::Select;
+                        state.drag = Drag::Select {
+                            click: (click.kind() == click::Kind::Single
+                                && !state.modifiers.shift())
+                            .then_some(position),
+                        };
 
                         publish(Interaction::Pressed {
                             at: position,
@@ -1226,14 +1256,20 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for View<'_, Message>
 
                 shell.capture_event();
             }
-            Event::Mouse(mouse::Event::CursorMoved { position }) => match state.drag {
-                Drag::Select => publish(Interaction::Dragged {
-                    at: local(*position),
-                }),
+            Event::Mouse(mouse::Event::CursorMoved { position }) => match &mut state.drag {
+                Drag::Select { click } => {
+                    let at = local(*position);
+
+                    if click.is_some_and(|from| from.distance(at) > CLICK_SLACK) {
+                        *click = None;
+                    }
+
+                    publish(Interaction::Dragged { at });
+                }
                 Drag::Scrollbar { grab } => {
                     if let Some(thumb) = self.viewer.scrollbar() {
                         publish(Interaction::ScrolledTo {
-                            fraction: self.scroll_fraction(thumb, local(*position).y, grab),
+                            fraction: self.scroll_fraction(thumb, local(*position).y, *grab),
                         });
                     }
                 }
@@ -1242,8 +1278,13 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for View<'_, Message>
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
                 if state.drag != Drag::None =>
             {
-                state.drag = Drag::None;
+                let drag = std::mem::take(&mut state.drag);
+
                 publish(Interaction::Released);
+
+                if let Drag::Select { click: Some(at) } = drag {
+                    publish(Interaction::Clicked { at });
+                }
             }
             _ => {}
         }
@@ -1261,9 +1302,10 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for View<'_, Message>
         let bounds = layout.bounds();
 
         match state.drag {
-            Drag::Select => return mouse::Interaction::Text,
+            Drag::Select { click: None } => return mouse::Interaction::Text,
             Drag::Scrollbar { .. } => return mouse::Interaction::Idle,
-            Drag::None => {}
+            // A press that may yet be a click shows what is under it.
+            Drag::Select { click: Some(_) } | Drag::None => {}
         }
 
         let Some(position) = cursor.position_in(bounds) else {
@@ -1273,7 +1315,11 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for View<'_, Message>
         let in_gutter = self.viewer.scrollbar().is_some()
             && position.x >= bounds.width - SCROLLBAR_WIDTH - 2.0 * SCROLLBAR_INSET;
 
-        if !in_gutter && self.viewer.is_over_text(position) {
+        if in_gutter {
+            mouse::Interaction::Idle
+        } else if self.viewer.link_at(position).is_some() {
+            mouse::Interaction::Pointer
+        } else if self.viewer.is_over_text(position) {
             mouse::Interaction::Text
         } else {
             mouse::Interaction::Idle
@@ -1473,12 +1519,13 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for View<'_, Message>
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::path::PathBuf;
 
     use iced::mouse::{Button, ScrollDelta};
 
     use super::*;
+    use crate::engine::Target;
     use crate::engine::text::Glyph;
 
     const LETTER: PageSize = PageSize {
@@ -1525,8 +1572,28 @@ mod tests {
         ))
     }
 
+    /// The page of [`hello`], with the word a link to a place on page 3.
+    fn linked() -> Arc<PageText> {
+        let mut text = Arc::into_inner(hello()).unwrap();
+
+        text.links.push(Link {
+            rect: Rect {
+                x0: 100.0,
+                y0: 100.0,
+                x1: 150.0,
+                y1: 112.0,
+            },
+            target: Target::Page {
+                page: 2,
+                top: Some(300.0),
+            },
+        });
+
+        Arc::new(text)
+    }
+
     /// Where a page-space point currently sits in the viewport.
-    fn on_screen(viewer: &Viewer, page: u32, x: f32, y: f32) -> Point {
+    pub(crate) fn on_screen(viewer: &Viewer, page: u32, x: f32, y: f32) -> Point {
         let rect = viewer.page_rect(page);
         let size = viewer.size(page);
 
@@ -1767,6 +1834,125 @@ mod tests {
 
         assert!(viewer.is_over_text(on_screen(&viewer, 0, 120.0, 106.0)));
         assert!(!viewer.is_over_text(on_screen(&viewer, 0, 400.0, 400.0)));
+    }
+
+    #[test]
+    fn finds_the_link_under_the_cursor() {
+        let mut viewer = viewer(5);
+        let over = on_screen(&viewer, 0, 120.0, 106.0);
+
+        // Not before the page's text has come, and its links with it.
+        assert_eq!(viewer.link_at(over), None);
+
+        viewer.insert_text(0, linked());
+
+        assert_eq!(
+            viewer.link_at(over).map(|link| &link.target),
+            Some(&Target::Page {
+                page: 2,
+                top: Some(300.0)
+            })
+        );
+        assert_eq!(viewer.link_at(on_screen(&viewer, 0, 120.0, 130.0)), None);
+    }
+
+    #[test]
+    fn goes_to_a_place_on_a_page() {
+        let mut viewer = viewer(5);
+
+        viewer.go_to(2, Some(300.0));
+
+        // The place is at the top of the view, under the usual gap.
+        let place = on_screen(&viewer, 2, 0.0, 300.0);
+
+        assert!((place.y - GAP).abs() < 1.0, "{place:?}");
+        assert_eq!(viewer.current_page(), 2);
+
+        // A place off the foot of the page is its foot, and no further.
+        viewer.go_to(2, Some(5000.0));
+
+        let foot = on_screen(&viewer, 2, 0.0, LETTER.height);
+
+        assert!((foot.y - GAP).abs() < 1.0, "{foot:?}");
+    }
+
+    #[test]
+    fn widget_tells_a_click_from_a_drag() {
+        let viewer = viewer(10);
+        let interactions = |events: &[Event]| -> Vec<Interaction> {
+            let mut ui = iced_test::Simulator::with_size(
+                iced::Settings::default(),
+                Size::new(800.0, 600.0),
+                view(&viewer, Palette::DARK, |interaction| interaction),
+            );
+
+            ui.point_at(Point::new(300.0, 200.0));
+            ui.simulate(events.iter().cloned());
+            ui.into_messages().collect()
+        };
+        let clicks = |events: &[Event]| -> Vec<Point> {
+            interactions(events)
+                .into_iter()
+                .filter_map(|interaction| match interaction {
+                    Interaction::Clicked { at } => Some(at),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        let press = Event::Mouse(mouse::Event::ButtonPressed(Button::Left));
+        let release = Event::Mouse(mouse::Event::ButtonReleased(Button::Left));
+        let move_to = |x, y| {
+            Event::Mouse(mouse::Event::CursorMoved {
+                position: Point::new(x, y),
+            })
+        };
+
+        // A hand is not perfectly still: the click is where it pressed.
+        assert_eq!(
+            interactions(&[press.clone(), move_to(302.0, 201.0), release.clone()])[2..],
+            [
+                Interaction::Released,
+                Interaction::Clicked {
+                    at: Point::new(300.0, 200.0)
+                }
+            ]
+        );
+
+        // A drag is not a click, wherever it ends.
+        assert_eq!(
+            clicks(&[
+                press.clone(),
+                move_to(340.0, 260.0),
+                move_to(300.0, 200.0),
+                release.clone()
+            ]),
+            []
+        );
+
+        // Nor is the second press of a double click, which selects a word.
+        assert_eq!(
+            clicks(&[
+                press.clone(),
+                release.clone(),
+                press.clone(),
+                release.clone()
+            ])
+            .len(),
+            1
+        );
+
+        // Nor a press with Shift, which extends the selection.
+        assert_eq!(
+            clicks(&[
+                Event::Keyboard(keyboard::Event::ModifiersChanged(
+                    keyboard::Modifiers::SHIFT
+                )),
+                press,
+                release
+            ]),
+            []
+        );
     }
 
     #[test]

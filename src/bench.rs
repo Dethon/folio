@@ -127,10 +127,12 @@ pub fn run(path: PathBuf) -> i32 {
     );
 
     let mut glyphs = 0usize;
+    let mut links = 0usize;
 
     wait(&events, pages as usize, |event| match event {
         Event::Text { text, .. } => {
             glyphs += text.glyphs.len();
+            links += text.links.len();
             true
         }
         _ => false,
@@ -139,7 +141,7 @@ pub fn run(path: PathBuf) -> i32 {
     let elapsed = milliseconds(started);
 
     println!(
-        "text            {elapsed:8.1} ms   {glyphs} glyphs, {:.2} ms a page",
+        "text            {elapsed:8.1} ms   {glyphs} glyphs and {links} links, {:.2} ms a page",
         elapsed / pages.max(1) as f64,
     );
     report("text read");

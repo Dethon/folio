@@ -13,11 +13,12 @@ use iced::widget::scrollable;
 use iced::window;
 use iced::{Element, Size, Subscription, Task};
 
-use crate::engine::{self, DocInfo, Engine, JobKind, print};
+use crate::engine::{self, DocInfo, Engine, JobKind, Target, print};
 use crate::trace;
 use crate::ui::theme::Palette;
 use crate::ui::viewer::{Fit, Interaction, Viewer};
 use crate::ui::{self, icon, sidebar};
+use crate::web;
 
 /// Options taken from the command line.
 #[derive(Debug, Clone, Default)]
@@ -350,6 +351,26 @@ impl App {
         });
     }
 
+    /// Goes where a link leads.
+    fn follow(&mut self, target: Target) {
+        // What the press that clicked the link began to select.
+        self.viewer.clear_selection();
+
+        match target {
+            Target::Page { page, top } => self.viewer.go_to(page, top),
+            Target::Uri(uri) => match web::Address::parse(&uri) {
+                Some(address) => {
+                    self.notify(format!("Opening {}", address.place()), Tone::Info);
+                    address.open();
+                }
+                None => self.notify(
+                    "Folio only opens links to web pages and mail addresses.",
+                    Tone::Error,
+                ),
+            },
+        }
+    }
+
     fn document(&self) -> Option<&Arc<DocInfo>> {
         self.viewer.document()
     }
@@ -496,6 +517,11 @@ impl App {
                 } => self.viewer.press(at, granularity, extend),
                 Interaction::Dragged { at } => self.viewer.drag(at),
                 Interaction::Released => {}
+                Interaction::Clicked { at } => {
+                    if let Some(target) = self.viewer.link_at(at).map(|link| link.target.clone()) {
+                        self.follow(target);
+                    }
+                }
                 Interaction::ScrolledTo { fraction } => self.viewer.scroll_to_fraction(fraction),
             },
             Message::OpenDialog => {
@@ -1066,6 +1092,7 @@ pub fn run(options: Options) -> iced::Result {
 mod tests {
     use super::*;
     use crate::engine::tests::fixture_path;
+    use crate::ui::viewer::tests::on_screen;
 
     /// Runs updates until `done`, as the engine's wake-ups would.
     fn settle(app: &mut App, done: impl Fn(&App) -> bool) {
@@ -1139,6 +1166,44 @@ mod tests {
         assert_eq!(toast.tone, Tone::Error);
         assert!(toast.text.starts_with("Could not open no-such-file.pdf."));
         assert!(app.document().is_none() && app.opening.is_none());
+    }
+
+    #[test]
+    fn follows_a_link_to_its_place() {
+        let (mut app, _) = App::boot(Options {
+            file: Some(fixture_path()),
+            ..Options::default()
+        });
+
+        settle(&mut app, |app| app.document().is_some());
+
+        // The second paragraph of the first page is a link to a place 52pt
+        // down the second.
+        let link = |app: &App| on_screen(&app.viewer, 0, 100.0, 188.0);
+
+        settle(&mut app, |app| app.viewer.link_at(link(app)).is_some());
+
+        let at = link(&app);
+        let _ = app.update(Message::Viewer(Interaction::Clicked { at }));
+
+        assert_eq!(app.viewer.current_page(), 1);
+        assert_eq!(app.page_input, "2");
+
+        let place = on_screen(&app.viewer, 1, 0.0, 52.0);
+
+        assert!(place.y > 0.0 && place.y < 30.0, "{place:?}");
+    }
+
+    #[test]
+    fn opens_no_link_but_to_the_web() {
+        let (mut app, _) = App::boot(Options::default());
+
+        app.follow(Target::Uri("file:///C:/Windows/System32/calc.exe".into()));
+
+        let toast = app.toast.as_ref().unwrap();
+
+        assert_eq!(toast.tone, Tone::Error);
+        assert!(toast.text.contains("web pages"), "{}", toast.text);
     }
 
     #[test]
