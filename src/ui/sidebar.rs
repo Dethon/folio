@@ -65,7 +65,7 @@ pub struct State {
 impl Default for State {
     fn default() -> Self {
         Self {
-            open: true,
+            open: false,
             tab: Tab::Outline,
             offset: 0.0,
             height: 1200.0,
