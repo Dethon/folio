@@ -14,6 +14,9 @@ Chrome); the interface is [Iced](https://iced.rs) on the GPU.
 - **Searching.** Ctrl+F finds as you type, starting from where you are, and
   highlights every match. Case and accents are ignored, a phrase is found
   across a line break, and so is a word hyphenated over two lines.
+- **Links.** Click a link to go where it leads: a place in the document, or
+  a web page or mail address, which the browser or mail program opens.
+  Nothing else a document asks to have opened is.
 - **Copying.** Drag to select; double-click for a word, triple-click for a
   line, Shift-click to extend, Ctrl+A for everything; Ctrl+C copies.
 - **Printing.** The Windows print dialog, with page ranges. Pages are drawn
@@ -123,6 +126,11 @@ However it is shipped, `folio.exe` and `pdfium.dll` must stay together.
   as search sees it, at about a byte a character. Later searches, which is to
   say every keystroke after the first, only open the pages they will find
   something on.
+- **Links come with the text.** A page's links are read once, with its text
+  layer, and only for pages on show. Hovering and clicking are answered from
+  that on the UI thread, and nothing is drawn for them. On the book below
+  that is a few hundredths of a millisecond a page; a page of several hundred
+  links costs PDFium a few milliseconds to parse, once.
 - **Idle means idle.** There are no timers or animation loops; nothing runs
   until there is input.
 - **One graphics backend.** On Windows the renderer is pinned to Direct3D 12
@@ -198,10 +206,11 @@ src/
   app.rs             state, messages, update loop
   trace.rs           start-up timeline and memory report (FOLIO_TRACE)
   bench.rs           engine benchmark (--bench)
+  web.rs             opening web and mail links, and nothing else
   engine/            no UI dependencies
     mod.rs           Engine handle, events, work queue
     worker.rs        the PDFium thread: rendering, text extraction, jobs
-    text.rs          text layer, hit testing, selection ranges
+    text.rs          text layer and links, hit testing, selection ranges
     markdown.rs      structure inference and Markdown output
     table.rs         table detection from ruling lines
     print.rs         Windows print dialog and device rendering
@@ -216,7 +225,10 @@ examples/make-icon.rs  renders the icon artwork to .ico / .png / .bmp
 
 ## Not there yet
 
-- Clickable links and password-protected documents.
+- Password-protected documents.
+- Links are the ones the document marks as such: an address that is only
+  printed in the text is not clickable. There is no going back to where a
+  link was followed from, and links into other files are not followed.
 - Search matches whole text only: no whole-word or regular-expression
   options, a phrase split across two pages is not found, and it stops
   counting at 20,000 matches.
