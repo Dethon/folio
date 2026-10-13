@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use pdfium_render::prelude::*;
 
@@ -31,8 +31,29 @@ const RECYCLE_AFTER: u32 = 96;
 /// it looks at the queue again.
 const SEARCH_STRIDE: u32 = 256;
 
+/// PDFium keeps state that every document in the process shares, and is not
+/// thread safe. The bindings promise to serialise calls to it, but their lock
+/// leaves out a good third of its functions, rendering among them; nor could
+/// it cover the calls `print` makes to the library directly. So an engine
+/// holds this for as long as it is in the library: for each task, and to
+/// open and close a document.
+///
+/// The application has one engine, which never waits here. It is for where
+/// there are several, as in the tests: without it they parse over each other
+/// and documents come back missing pages, text or outline.
+static EXCLUSIVE: Mutex<()> = Mutex::new(());
+
+fn exclusive() -> MutexGuard<'static, ()> {
+    // There is nothing behind the lock for a panic to have left half done.
+    EXCLUSIVE.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 pub(crate) fn run(shared: Arc<Shared>, emit: Emit) {
-    let pdfium = pdfium();
+    let pdfium = {
+        let _exclusive = exclusive();
+
+        pdfium()
+    };
     let mut next_id = 1u64;
 
     trace::mark("engine: pdfium bound");
@@ -53,8 +74,16 @@ pub(crate) fn run(shared: Arc<Shared>, emit: Emit) {
             }
         };
 
-        let document = match pdfium.load_pdf_from_file(&path, None) {
-            Ok(document) => document,
+        let opened = {
+            let _exclusive = exclusive();
+
+            pdfium
+                .load_pdf_from_file(&path, None)
+                .map(|document| (Arc::new(describe(&document, next_id, &path)), document))
+        };
+
+        let (info, document) = match opened {
+            Ok(opened) => opened,
             Err(error) => {
                 emit(Event::OpenFailed {
                     path,
@@ -64,7 +93,6 @@ pub(crate) fn run(shared: Arc<Shared>, emit: Emit) {
             }
         };
 
-        let info = Arc::new(describe(&document, next_id, &path));
         next_id += 1;
 
         trace::mark("engine: document described");
@@ -84,7 +112,7 @@ pub(crate) fn run(shared: Arc<Shared>, emit: Emit) {
 
         emit(Event::Opened(info.clone()));
 
-        let session = Session {
+        let mut session = Session {
             pdfium,
             pages: VecDeque::new(),
             document,
@@ -101,7 +129,16 @@ pub(crate) fn run(shared: Arc<Shared>, emit: Emit) {
             job: None,
         };
 
-        if session.serve() == Exit::Shutdown {
+        let exit = session.serve();
+
+        // Closing the document and its pages is a call into the library too.
+        {
+            let _exclusive = exclusive();
+
+            drop(session);
+        }
+
+        if exit == Exit::Shutdown {
             return;
         }
     }
@@ -323,7 +360,7 @@ struct Session<'s, 'p> {
 }
 
 impl<'p> Session<'_, 'p> {
-    fn serve(mut self) -> Exit {
+    fn serve(&mut self) -> Exit {
         loop {
             let task = {
                 let Ok(mut queue) = self.shared.queue.lock() else {
@@ -392,6 +429,8 @@ impl<'p> Session<'_, 'p> {
                     queue = guard;
                 }
             };
+
+            let _exclusive = exclusive();
 
             match task {
                 Task::Tidy => self.tidy(),
