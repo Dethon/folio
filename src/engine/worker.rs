@@ -7,7 +7,7 @@ use pdfium_render::prelude::*;
 use crate::trace;
 
 use super::table::Rule;
-use super::text::{self, Glyph, Rect};
+use super::text::{self, Glyph, LINK_LIMIT, Rect, URI_LIMIT};
 use super::{
     Bitmap, CopyRequest, DocInfo, Event, Job, JobKind, Link, MATCH_LIMIT, Match, Open, OutlineItem,
     PageSize, PageText, SearchRequest, Shared, THUMBNAIL_WIDTH, TILE, Target, TileKey, Wanted,
@@ -30,12 +30,6 @@ const RECYCLE_AFTER: u32 = 96;
 /// Pages a search may rule out, from what it remembers of their text, before
 /// it looks at the queue again.
 const SEARCH_STRIDE: u32 = 256;
-
-/// Links read from one page. A page with more was not made to be read.
-const LINK_LIMIT: usize = 4_096;
-
-/// The longest address kept. Browsers stop about here too.
-const URI_LIMIT: usize = 2_048;
 
 pub(crate) fn run(shared: Arc<Shared>, emit: Emit) {
     let pdfium = pdfium();
@@ -597,7 +591,12 @@ impl<'p> Session<'_, 'p> {
         let text = self.page(index).and_then(|page| {
             let mut text = extract(page, false)?;
 
-            text.links = links(page, &info.pages);
+            let width = info
+                .pages
+                .get(index as usize)
+                .map_or(0.0, |size| size.width);
+
+            text.set_links(links(page, &info.pages), width);
             Some(text)
         });
 
@@ -1203,7 +1202,7 @@ fn extract(page: &PdfPage, styled: bool) -> Option<PageText> {
     Some(PageText::new(glyphs))
 }
 
-/// Reads the links of a page, in the order PDFium paints its annotations.
+/// Reads the links a page marks, in the order PDFium paints its annotations.
 /// `pages` is the document's, for placing where each link leads.
 fn links(page: &PdfPage, pages: &[PageSize]) -> Vec<Link> {
     let annotations = page.annotations();
@@ -1255,7 +1254,18 @@ fn target(link: &PdfLink, pages: &[PageSize]) -> Option<Target> {
         Some(action) => match action.action_type() {
             PdfActionType::GoToDestinationInSameDocument => link.destination(),
             PdfActionType::Uri => {
-                let uri = action.as_uri_action()?.uri().ok()?;
+                let uri = match action.as_uri_action()?.uri() {
+                    Ok(uri) => uri,
+                    // Not UTF-8: an address with a letter outside ASCII,
+                    // from a producer that writes one byte to the letter.
+                    Err(PdfiumError::CStringConversionError(error)) => error
+                        .into_cstring()
+                        .as_bytes()
+                        .iter()
+                        .map(|byte| char::from(*byte))
+                        .collect(),
+                    Err(_) => return None,
+                };
 
                 return (!uri.is_empty() && uri.len() <= URI_LIMIT)
                     .then(|| Target::Uri(uri.into_boxed_str()));

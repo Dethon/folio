@@ -44,6 +44,10 @@ impl Rect {
     pub fn contains(&self, x: f32, y: f32) -> bool {
         x >= self.x0 && x <= self.x1 && y >= self.y0 && y <= self.y1
     }
+
+    pub fn intersects(&self, other: &Rect) -> bool {
+        self.x0 < other.x1 && other.x0 < self.x1 && self.y0 < other.y1 && other.y0 < self.y1
+    }
 }
 
 pub const BOLD: u8 = 1;
@@ -134,6 +138,19 @@ pub struct Link {
     pub target: Target,
 }
 
+/// Links kept of one page. A page with more was not made to be read.
+pub const LINK_LIMIT: usize = 4_096;
+
+/// The longest address kept. Browsers stop about here too.
+pub const URI_LIMIT: usize = 2_048;
+
+/// What an address written out in the text may begin with.
+const ADDRESS_STARTS: [&str; 3] = ["https://", "http://", "www."];
+
+/// How much of the page's width a line must span to count as full, and so
+/// for an address that runs to its end to be looked for on the next.
+const FULL_LINE: f32 = 0.55;
+
 #[derive(Debug, Default)]
 pub struct PageText {
     pub glyphs: Vec<Glyph>,
@@ -152,6 +169,162 @@ impl PageText {
             lines,
             links: Vec::new(),
         }
+    }
+
+    /// Sets the links of the page: the ones the document marks, over the
+    /// addresses its text spells out. `width` is the page's, in points.
+    ///
+    /// A mark wins where the two meet, being what the author meant, unless
+    /// it is the written address cut short: some producers mark an address
+    /// only as far as its first odd character, and link that much.
+    pub fn set_links(&mut self, mut marked: Vec<Link>, width: f32) {
+        let mut links = self.addresses(width);
+
+        marked.retain(|mark| !links.iter().any(|written| completes(written, mark)));
+        links.retain(|written| {
+            let (x, y) = (
+                (written.rect.x0 + written.rect.x1) * 0.5,
+                written.rect.center_y(),
+            );
+
+            !marked.iter().any(|mark| mark.rect.contains(x, y))
+        });
+
+        links.append(&mut marked);
+        links.truncate(LINK_LIMIT);
+        links.shrink_to_fit();
+
+        self.links = links;
+    }
+
+    /// The addresses written out in the text, one link for each line an
+    /// address runs over.
+    pub fn addresses(&self, width: f32) -> Vec<Link> {
+        let mut links = Vec::new();
+        let mut at = 0;
+
+        while at < self.len() && links.len() < LINK_LIMIT {
+            let Some(start) = self.address_start(at) else {
+                at += 1;
+                continue;
+            };
+
+            let mut line = self.lines.partition_point(|line| line.glyphs.end <= at);
+            let Some(mut end) = self.lines.get(line).map(|line| self.visible_end(line)) else {
+                break;
+            };
+            let mut stop = self.address_end(at + start.len() as u32, end);
+            let mut address = self.text(at..stop);
+
+            // Broken where the line ran out, and carried on below.
+            while stop == end && self.continues(line, width) {
+                line += 1;
+
+                let from = self.lines[line].glyphs.start;
+
+                end = self.visible_end(&self.lines[line]);
+                stop = self.address_end(from, end);
+                address.push_str(&self.text(from..stop));
+            }
+
+            // What ends a sentence or closes a bracket around the address is
+            // not part of it.
+            while let Some(last) = address.chars().next_back()
+                && (matches!(last, '.' | ',' | ';' | ':' | '!' | '?' | '\'')
+                    || matches!(last, ')' | ']' | '}') && !closes(&address, last))
+            {
+                address.pop();
+                stop -= 1;
+            }
+
+            if address.len() > start.len()
+                && address.len() <= URI_LIMIT
+                && address[start.len()..].starts_with(|ch: char| ch.is_alphanumeric())
+                && (start != "www." || address[start.len()..].contains('.'))
+            {
+                if start == "www." {
+                    address.insert_str(0, "http://");
+                }
+
+                let target = Target::Uri(address.into());
+
+                links.extend(self.rects(at..stop).into_iter().map(|rect| Link {
+                    rect,
+                    target: target.clone(),
+                }));
+            }
+
+            at = stop.max(at + 1);
+        }
+
+        links
+    }
+
+    /// How an address beginning at glyph `at` begins, if one does.
+    fn address_start(&self, at: u32) -> Option<&'static str> {
+        let glyphs = &self.glyphs[at as usize..];
+
+        // Nearly every glyph is turned away here.
+        if !matches!(glyphs.first()?.ch, 'h' | 'H' | 'w' | 'W')
+            || at > 0 && self.glyphs[at as usize - 1].ch.is_alphanumeric()
+        {
+            return None;
+        }
+
+        ADDRESS_STARTS.into_iter().find(|start| {
+            glyphs.len() >= start.len()
+                && start
+                    .chars()
+                    .zip(glyphs)
+                    .all(|(ch, glyph)| glyph.ch.eq_ignore_ascii_case(&ch))
+        })
+    }
+
+    /// Where the part of an address that starts at `from` stops, short of
+    /// `end`: at a space, or at what an address is quoted in.
+    fn address_end(&self, from: u32, end: u32) -> u32 {
+        (from..end)
+            .find(|index| {
+                let ch = self.glyphs[*index as usize].ch;
+
+                ch.is_whitespace() || ch.is_control() || "\"<>“”«»".contains(ch)
+            })
+            .unwrap_or(end)
+    }
+
+    /// Whether an address that runs to the end of line `index` carries on
+    /// at the start of the next: the line is full, the next begins under
+    /// it, and with what could only be more of an address.
+    fn continues(&self, index: usize, width: f32) -> bool {
+        let line = &self.lines[index];
+        let Some(next) = self.lines.get(index + 1) else {
+            return false;
+        };
+
+        let height = line.rect.height();
+        let below = next.rect.y0 > line.rect.center_y() && next.rect.y0 - line.rect.y1 < height;
+        let aligned = next.rect.x0 <= line.rect.x0 + height;
+        let full =
+            line.rect.width() >= width * FULL_LINE && line.rect.x1 >= next.rect.x1 - 2.0 * height;
+
+        if !(below && aligned && full) || self.address_start(next.glyphs.start).is_some() {
+            return false;
+        }
+
+        let stop = self.address_end(next.glyphs.start, self.visible_end(next));
+        let token = self.text(next.glyphs.start..stop);
+        let escape = |(at, _): (usize, &str)| {
+            token[at + 1..]
+                .chars()
+                .take(2)
+                .filter(char::is_ascii_hexdigit)
+                .count()
+                == 2
+        };
+
+        token.contains(['=', '&'])
+            || token.matches('/').count() >= 2
+            || token.match_indices('%').any(escape)
     }
 
     /// The link under a point: the top-most, where they overlap.
@@ -363,6 +536,30 @@ impl PageText {
             .map(|glyph| glyph.ch)
             .collect()
     }
+}
+
+/// Whether a written address is all of what a marked link gives the start
+/// of, there on the page.
+fn completes(written: &Link, mark: &Link) -> bool {
+    match (&written.target, &mark.target) {
+        (Target::Uri(written_uri), Target::Uri(marked_uri)) => {
+            written.rect.intersects(&mark.rect)
+                && written_uri.len() > marked_uri.len()
+                && written_uri.starts_with(&**marked_uri)
+        }
+        _ => false,
+    }
+}
+
+/// Whether the bracket ending `address` closes one opened within it.
+fn closes(address: &str, bracket: char) -> bool {
+    let open = match bracket {
+        ')' => '(',
+        ']' => '[',
+        _ => '{',
+    };
+
+    address.matches(open).count() >= address.matches(bracket).count()
 }
 
 /// A search query, folded the way page text is folded for matching: case,
@@ -881,6 +1078,130 @@ mod tests {
 
         assert_eq!(found(&text, "fine"), ["ﬁne"]);
         assert_eq!(found(&text, "don't"), ["don’t"]);
+    }
+
+    /// The addresses written on a page `width` points wide, once each.
+    fn addresses(text: &PageText, width: f32) -> Vec<String> {
+        let mut found: Vec<String> = Vec::new();
+
+        for link in text.addresses(width) {
+            let Target::Uri(uri) = link.target else {
+                panic!("an address is an address");
+            };
+
+            if found.last().map(String::as_str) != Some(&*uri) {
+                found.push(uri.into());
+            }
+        }
+
+        found
+    }
+
+    #[test]
+    fn finds_the_addresses_written_in_the_text() {
+        let text = page(&[
+            "See https://example.com/a(b)/{id}?c=1. Or",
+            "(www.example.org), or \"HTTP://example.net/x\",",
+            "but not an http header, httpStatus, http:// or www.",
+        ]);
+
+        assert_eq!(
+            addresses(&text, 1000.0),
+            [
+                "https://example.com/a(b)/{id}?c=1",
+                "http://www.example.org",
+                "HTTP://example.net/x"
+            ]
+        );
+
+        // The link covers the address and no more of its line.
+        let first = &text.addresses(1000.0)[0];
+
+        assert_eq!((first.rect.x0, first.rect.x1), (40.0, 370.0));
+        assert_eq!((first.rect.y0, first.rect.y1), (0.0, 12.0));
+    }
+
+    #[test]
+    fn joins_an_address_broken_across_lines() {
+        let text = page(&[
+            "https://example.com/search?a=1&b=2&so",
+            "rt=desc&key={key}&lang=es&order=asc&pa",
+            "ge=2 and more",
+        ]);
+
+        // On a page the lines fill, they are one address, linked line by
+        // line.
+        let links = text.addresses(400.0);
+
+        assert_eq!(links.len(), 3);
+        assert_eq!(
+            addresses(&text, 400.0),
+            ["https://example.com/search?a=1&b=2&sort=desc&key={key}&lang=es&order=asc&page=2"]
+        );
+        assert_eq!((links[2].rect.x0, links[2].rect.x1), (0.0, 40.0));
+
+        // On a wider one the first line ended of its own accord.
+        assert_eq!(
+            addresses(&text, 1000.0),
+            ["https://example.com/search?a=1&b=2&so"]
+        );
+    }
+
+    #[test]
+    fn leaves_what_follows_an_address_out_of_it() {
+        for next in ["for more", "https://example.com/b?c=1", "50% off"] {
+            let text = page(&["read https://example.com/a/b/c/d/e/f", next]);
+
+            assert_eq!(
+                addresses(&text, 400.0)[0],
+                "https://example.com/a/b/c/d/e/f",
+                "{next:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn marked_links_go_over_written_ones() {
+        let written = "see https://example.com/a/b here";
+        let rect = |from: usize, to: usize| Rect {
+            x0: from as f32 * 10.0,
+            y0: 0.0,
+            x1: to as f32 * 10.0,
+            y1: 12.0,
+        };
+        let marked = |from, to, target: Target| Link {
+            rect: rect(from, to),
+            target,
+        };
+        let targets = |marked: Vec<Link>| {
+            let mut text = page(&[written]);
+
+            text.set_links(marked, 1000.0);
+            text.links
+                .iter()
+                .map(|link| (link.rect, link.target.clone()))
+                .collect::<Vec<_>>()
+        };
+        let address = Target::Uri("https://example.com/a/b".into());
+
+        assert_eq!(targets(Vec::new()), [(rect(4, 27), address.clone())]);
+
+        // Marked as well as written: the mark is the link.
+        let elsewhere = Target::Page { page: 3, top: None };
+
+        assert_eq!(
+            targets(vec![marked(4, 27, elsewhere.clone())]),
+            [(rect(4, 27), elsewhere)]
+        );
+
+        // Marked over its first part only, and cut short to match: the
+        // address as written is the link, all of it.
+        let short = Target::Uri("https://example.com/".into());
+
+        assert_eq!(
+            targets(vec![marked(4, 24, short)]),
+            [(rect(4, 27), address)]
+        );
     }
 
     #[test]

@@ -16,7 +16,9 @@ Chrome); the interface is [Iced](https://iced.rs) on the GPU.
   across a line break, and so is a word hyphenated over two lines.
 - **Links.** Click a link to go where it leads: a place in the document, or
   a web page or mail address, which the browser or mail program opens.
-  Nothing else a document asks to have opened is.
+  Nothing else a document asks to have opened is. A web address that is
+  only written out in the text is a link too, whole even where it runs over
+  several lines.
 - **Copying.** Drag to select; double-click for a word, triple-click for a
   line, Shift-click to extend, Ctrl+A for everything; Ctrl+C copies.
 - **Printing.** The Windows print dialog, with page ranges. Pages are drawn
@@ -127,7 +129,8 @@ However it is shipped, `folio.exe` and `pdfium.dll` must stay together.
   say every keystroke after the first, only open the pages they will find
   something on.
 - **Links come with the text.** A page's links are read once, with its text
-  layer, and only for pages on show. Hovering and clicking are answered from
+  layer, and only for pages on show; the addresses written in the text are
+  picked out of that layer in the same pass. Hovering and clicking are answered from
   that on the UI thread, and nothing is drawn for them. On the book below
   that is a few hundredths of a millisecond a page; a page of several hundred
   links costs PDFium a few milliseconds to parse, once.
@@ -226,9 +229,11 @@ examples/make-icon.rs  renders the icon artwork to .ico / .png / .bmp
 ## Not there yet
 
 - Password-protected documents.
-- Links are the ones the document marks as such: an address that is only
-  printed in the text is not clickable. There is no going back to where a
-  link was followed from, and links into other files are not followed.
+- There is no going back to where a link was followed from, and links into
+  other files are not followed. An address written in the text is only
+  joined across a line break when the line is full and what follows could
+  only be more of it, so one broken in the middle of a plain word stops
+  there.
 - Search matches whole text only: no whole-word or regular-expression
   options, a phrase split across two pages is not found, and it stops
   counting at 20,000 matches.
