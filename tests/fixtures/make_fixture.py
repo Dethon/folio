@@ -1,4 +1,4 @@
-"""Writes a small PDF with headings, body text, a list, an outline and two tables.
+"""Writes a small PDF with headings, body text, a list, links, an outline and two tables.
 
 Run as: python3 make_fixture.py sample.pdf
 """
@@ -53,7 +53,8 @@ objects = {}
 objects[1] = b"<< /Type /Catalog /Pages 2 0 R /Outlines 10 0 R /PageMode /UseOutlines >>"
 objects[2] = b"<< /Type /Pages /Kids [3 0 R 4 0 R 14 0 R] /Count 3 >>"
 res = b"<< /Font << /F1 7 0 R /F2 8 0 R /F3 9 0 R >> >>"
-objects[3] = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R /Resources " + res + b" >>"
+objects[3] = (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R /Resources " + res
+              + b" /Annots [17 0 R 18 0 R 19 0 R 20 0 R 21 0 R] >>")
 objects[4] = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 6 0 R /Resources " + res + b" >>"
 objects[5] = b"<< /Length %d >>\nstream\n" % len(page1) + page1 + b"\nendstream"
 objects[6] = b"<< /Length %d >>\nstream\n" % len(page2) + page2 + b"\nendstream"
@@ -70,6 +71,16 @@ objects[14] = (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 
 objects[15] = b"<< /Length %d >>\nstream\n" % len(page3) + page3 + b"\nendstream"
 objects[16] = (b"<< /Type /XObject /Subtype /Form /BBox [0 0 612 792] /Length %d >>\nstream\n" % len(rules)
                + rules + b"\nendstream")
+
+# Links on the first page, none of them drawn. A hidden annotation of another
+# kind comes first, so that a link's place among the annotations is not its
+# place among the links. The last is one a reader must not follow.
+link = b"<< /Type /Annot /Subtype /Link /Border [0 0 0] /Rect [%d %d %d %d] %s >>"
+objects[17] = b"<< /Type /Annot /Subtype /Square /Rect [500 700 520 720] /F 2 >>"
+objects[18] = link % (72, 653, 200, 667, b"/A << /S /URI /URI (https://example.com/folio?q=1) >>")
+objects[19] = link % (72, 597, 200, 611, b"/Dest [4 0 R /XYZ 72 740 0]")
+objects[20] = link % (72, 569, 140, 583, b"/A << /S /GoTo /D [14 0 R /Fit] >>")
+objects[21] = link % (72, 555, 140, 569, b"/A << /S /Launch /F (cmd.exe) >>")
 
 out = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
 offsets = {}

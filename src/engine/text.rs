@@ -1,4 +1,5 @@
-//! The text layer of a page: glyph boxes grouped into lines.
+//! The text layer of a page: glyph boxes grouped into lines, and the links
+//! laid over them.
 //!
 //! Everything here is plain data with no dependency on PDFium, so selection
 //! and hit testing can run on the UI thread against a cached [`PageText`].
@@ -116,17 +117,49 @@ pub enum Granularity {
     Line,
 }
 
+/// Where a link leads.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Target {
+    /// A page of this document, and how far down it in points, if the link
+    /// says.
+    Page { page: u32, top: Option<f32> },
+    /// An address, as the document gives it: not to be trusted.
+    Uri(Box<str>),
+}
+
+/// An area of a page that leads somewhere when clicked.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Link {
+    pub rect: Rect,
+    pub target: Target,
+}
+
 #[derive(Debug, Default)]
 pub struct PageText {
     pub glyphs: Vec<Glyph>,
     pub lines: Vec<Line>,
+    /// The links of the page, bottom-most first. Only filled in for the
+    /// pages on show: a search or an export reads the text alone.
+    pub links: Vec<Link>,
 }
 
 impl PageText {
     pub fn new(glyphs: Vec<Glyph>) -> Self {
         let lines = group_lines(&glyphs);
 
-        Self { glyphs, lines }
+        Self {
+            glyphs,
+            lines,
+            links: Vec::new(),
+        }
+    }
+
+    /// The link under a point: the top-most, where they overlap.
+    pub fn link_at(&self, x: f32, y: f32) -> Option<&Link> {
+        self.links
+            .iter()
+            .rev()
+            .find(|link| link.rect.contains(x, y))
     }
 
     pub fn len(&self) -> u32 {

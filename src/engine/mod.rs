@@ -17,7 +17,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 
-pub use text::{Anchor, Granularity, PageText, Rect};
+pub use text::{Anchor, Granularity, Link, PageText, Rect, Target};
 
 /// Edge length of a render tile in device pixels.
 ///
@@ -618,6 +618,51 @@ pub(crate) mod tests {
             first.rect
         );
         assert!((first.rect.x0 - 72.0).abs() < 3.0, "{:?}", first.rect);
+    }
+
+    #[test]
+    fn reads_the_links_of_a_page() {
+        let fixture = open_fixture();
+
+        fixture.want(Wanted {
+            texts: vec![0],
+            ..Wanted::default()
+        });
+
+        let text = fixture.wait(|event| match event {
+            Event::Text { page: 0, text, .. } => Some(text),
+            _ => None,
+        });
+
+        // One to an address, one to a place on the second page, one to the
+        // third page. Neither the annotation that is not a link nor the link
+        // that would run a program is among them.
+        let targets: Vec<_> = text.links.iter().map(|link| link.target.clone()).collect();
+
+        assert_eq!(
+            targets,
+            [
+                Target::Uri("https://example.com/folio?q=1".into()),
+                Target::Page {
+                    page: 1,
+                    top: Some(52.0)
+                },
+                Target::Page { page: 2, top: None },
+            ]
+        );
+
+        // In view space, like the text: 653 to 667pt up a 792pt page.
+        assert_eq!(
+            text.links[0].rect,
+            Rect {
+                x0: 72.0,
+                y0: 125.0,
+                x1: 200.0,
+                y1: 139.0
+            }
+        );
+        assert_eq!(text.link_at(100.0, 130.0), Some(&text.links[0]));
+        assert_eq!(text.link_at(100.0, 150.0), None);
     }
 
     #[test]

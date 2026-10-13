@@ -7,7 +7,7 @@ endobj
 << /Type /Pages /Kids [3 0 R 4 0 R 14 0 R] /Count 3 >>
 endobj
 3 0 obj
-<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R /Resources << /Font << /F1 7 0 R /F2 8 0 R /F3 9 0 R >> >> >>
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R /Resources << /Font << /F1 7 0 R /F2 8 0 R /F3 9 0 R >> >> /Annots [17 0 R 18 0 R 19 0 R 20 0 R 21 0 R] >>
 endobj
 4 0 obj
 << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 6 0 R /Resources << /Font << /F1 7 0 R /F2 8 0 R /F3 9 0 R >> >> >>
@@ -102,27 +102,47 @@ stream
 42 680 m 330 680 l S
 endstream
 endobj
+17 0 obj
+<< /Type /Annot /Subtype /Square /Rect [500 700 520 720] /F 2 >>
+endobj
+18 0 obj
+<< /Type /Annot /Subtype /Link /Border [0 0 0] /Rect [72 653 200 667] /A << /S /URI /URI (https://example.com/folio?q=1) >> >>
+endobj
+19 0 obj
+<< /Type /Annot /Subtype /Link /Border [0 0 0] /Rect [72 597 200 611] /Dest [4 0 R /XYZ 72 740 0] >>
+endobj
+20 0 obj
+<< /Type /Annot /Subtype /Link /Border [0 0 0] /Rect [72 569 140 583] /A << /S /GoTo /D [14 0 R /Fit] >> >>
+endobj
+21 0 obj
+<< /Type /Annot /Subtype /Link /Border [0 0 0] /Rect [72 555 140 569] /A << /S /Launch /F (cmd.exe) >> >>
+endobj
 xref
-0 17
+0 22
 0000000000 65535 f 
 0000000015 00000 n 
 0000000104 00000 n 
 0000000174 00000 n 
-0000000320 00000 n 
-0000000466 00000 n 
-0000001113 00000 n 
-0000001302 00000 n 
-0000001399 00000 n 
-0000001501 00000 n 
-0000001596 00000 n 
-0000001670 00000 n 
-0000001770 00000 n 
-0000001865 00000 n 
-0000001912 00000 n 
-0000002087 00000 n 
-0000003033 00000 n 
+0000000365 00000 n 
+0000000511 00000 n 
+0000001158 00000 n 
+0000001347 00000 n 
+0000001444 00000 n 
+0000001546 00000 n 
+0000001641 00000 n 
+0000001715 00000 n 
+0000001815 00000 n 
+0000001910 00000 n 
+0000001957 00000 n 
+0000002132 00000 n 
+0000003078 00000 n 
+0000003247 00000 n 
+0000003328 00000 n 
+0000003471 00000 n 
+0000003588 00000 n 
+0000003712 00000 n 
 trailer
-<< /Size 17 /Root 1 0 R /Info 13 0 R >>
+<< /Size 22 /Root 1 0 R /Info 13 0 R >>
 startxref
-3202
+3834
 %%EOF

@@ -9,9 +9,9 @@ use crate::trace;
 use super::table::Rule;
 use super::text::{self, Glyph, Rect};
 use super::{
-    Bitmap, CopyRequest, DocInfo, Event, Job, JobKind, MATCH_LIMIT, Match, Open, OutlineItem,
-    PageSize, PageText, SearchRequest, Shared, THUMBNAIL_WIDTH, TILE, TileKey, Wanted, markdown,
-    page_pixels, print,
+    Bitmap, CopyRequest, DocInfo, Event, Job, JobKind, Link, MATCH_LIMIT, Match, Open, OutlineItem,
+    PageSize, PageText, SearchRequest, Shared, THUMBNAIL_WIDTH, TILE, Target, TileKey, Wanted,
+    markdown, page_pixels, print,
 };
 
 type Emit = Box<dyn Fn(Event) + Send>;
@@ -30,6 +30,12 @@ const RECYCLE_AFTER: u32 = 96;
 /// Pages a search may rule out, from what it remembers of their text, before
 /// it looks at the queue again.
 const SEARCH_STRIDE: u32 = 256;
+
+/// Links read from one page. A page with more was not made to be read.
+const LINK_LIMIT: usize = 4_096;
+
+/// The longest address kept. Browsers stop about here too.
+const URI_LIMIT: usize = 2_048;
 
 pub(crate) fn run(shared: Arc<Shared>, emit: Emit) {
     let pdfium = pdfium();
@@ -585,7 +591,15 @@ impl<'p> Session<'_, 'p> {
     }
 
     fn text(&mut self, index: u32) {
-        let text = self.page(index).and_then(|page| extract(page, false));
+        let info = self.info.clone();
+        // The links come with the text of a page on show, and with no other:
+        // nothing that reads the whole document has a use for them.
+        let text = self.page(index).and_then(|page| {
+            let mut text = extract(page, false)?;
+
+            text.links = links(page, &info.pages);
+            Some(text)
+        });
 
         // A page that could not be read is not remembered as blank: that
         // would rule it out of every search to come.
@@ -1187,6 +1201,90 @@ fn extract(page: &PdfPage, styled: bool) -> Option<PageText> {
     }
 
     Some(PageText::new(glyphs))
+}
+
+/// Reads the links of a page, in the order PDFium paints its annotations.
+/// `pages` is the document's, for placing where each link leads.
+fn links(page: &PdfPage, pages: &[PageSize]) -> Vec<Link> {
+    let annotations = page.annotations();
+    let mut map = None;
+    let mut links = Vec::new();
+
+    // By place among the annotations of every kind: the library's own list
+    // of links counts the same way, and so repeats a link once for every
+    // other annotation ahead of it.
+    for index in 0..annotations.len() {
+        if links.len() >= LINK_LIMIT {
+            break;
+        }
+
+        let Ok(annotation) = annotations.get(index) else {
+            continue;
+        };
+        let Some(link) = annotation
+            .as_link_annotation()
+            .and_then(|annotation| annotation.link().ok())
+        else {
+            continue;
+        };
+        let Some(target) = target(&link, pages) else {
+            continue;
+        };
+        let Ok(bounds) = annotation.bounds() else {
+            continue;
+        };
+
+        let rect = map.get_or_insert_with(|| ViewMap::new(page)).rect(&bounds);
+
+        if !rect.is_empty() {
+            links.push(Link { rect, target });
+        }
+    }
+
+    links.shrink_to_fit();
+    links
+}
+
+/// Where a link leads, if it is somewhere a reader may be taken: a place in
+/// this document or an address. A link that would run a program or open
+/// another file leads nowhere.
+fn target(link: &PdfLink, pages: &[PageSize]) -> Option<Target> {
+    let destination = match link.action() {
+        // A destination named outright, without an action.
+        None => link.destination(),
+        Some(action) => match action.action_type() {
+            PdfActionType::GoToDestinationInSameDocument => link.destination(),
+            PdfActionType::Uri => {
+                let uri = action.as_uri_action()?.uri().ok()?;
+
+                return (!uri.is_empty() && uri.len() <= URI_LIMIT)
+                    .then(|| Target::Uri(uri.into_boxed_str()));
+            }
+            // PDFium reads a destination out of these too, but the page it
+            // names is one of another document.
+            _ => None,
+        },
+    }?;
+
+    let page = u32::try_from(destination.page_index().ok()?).ok()?;
+    let size = pages.get(page as usize)?;
+
+    let top = match destination.view_settings().ok()? {
+        PdfDestinationViewSettings::SpecificCoordinatesAndZoom(_, top, _)
+        | PdfDestinationViewSettings::FitPageHorizontallyToWindow(top)
+        | PdfDestinationViewSettings::FitBoundsHorizontallyToWindow(top) => {
+            top.map(|top| top.value)
+        }
+        PdfDestinationViewSettings::FitPageToRectangle(rect) => Some(rect.top().value),
+        _ => None,
+    };
+
+    Some(Target::Page {
+        page,
+        // Measured up from the foot of the page, which is right unless that
+        // page is rotated or cropped; finding out would mean parsing it.
+        top: top.map(|top| (size.height - top).clamp(0.0, size.height)),
+    })
 }
 
 /// Per-page font table. Style is a property of the font, so it is resolved
