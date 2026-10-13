@@ -239,7 +239,10 @@ impl App {
             icon::set_scale_factor(scale_factor);
         }
 
-        let view = ui::page_view_size(WINDOW, app.options.sidebar.as_deref() != Some("hidden"));
+        // Hidden unless the command line asks for one of its lists.
+        app.sidebar.open = matches!(app.options.sidebar.as_deref(), Some("outline" | "pages"));
+
+        let view = ui::page_view_size(WINDOW, app.sidebar.open);
 
         app.viewer.set_viewport(view);
         // The sidebar's list reports its height only once it is scrolled.
@@ -975,7 +978,6 @@ fn present(
     match options.sidebar.take().as_deref() {
         Some("pages") => sidebar.show(sidebar::Tab::Pages),
         Some("outline") => sidebar.show(sidebar::Tab::Outline),
-        Some("hidden") => sidebar.open = false,
         _ => {}
     }
 
@@ -1115,7 +1117,7 @@ mod tests {
         });
 
         // There is no window, so no layout: the view is the size assumed.
-        assert_eq!(app.viewer.viewport(), ui::page_view_size(WINDOW, true));
+        assert_eq!(app.viewer.viewport(), ui::page_view_size(WINDOW, false));
         assert!(app.opening.is_some());
 
         settle(&mut app, |app| {
