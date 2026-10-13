@@ -666,6 +666,46 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn reads_the_addresses_a_page_writes_out() {
+        let fixture = open_fixture();
+
+        fixture.want(Wanted {
+            texts: vec![1],
+            ..Wanted::default()
+        });
+
+        let text = fixture.wait(|event| match event {
+            Event::Text { page: 1, text, .. } => Some(text),
+            _ => None,
+        });
+
+        let targets: Vec<_> = text.links.iter().map(|link| link.target.clone()).collect();
+
+        // The address in the text, whole, in place of the link to its first
+        // part that is marked over it; and a marked address with letters
+        // outside ASCII, written a byte to the letter.
+        assert_eq!(
+            targets,
+            [
+                Target::Uri("https://example.com/docs".into()),
+                Target::Uri("http://example.com/b\u{fa}squeda#caf\u{e9}".into())
+            ]
+        );
+
+        // Under the address and not the words before it, nor the full stop.
+        let rect = text.links[0].rect;
+        let line = text
+            .lines
+            .iter()
+            .find(|line| text.text(line.glyphs.clone()).contains("described"))
+            .expect("line exists");
+
+        assert!(rect.x0 > line.rect.x0 + 60.0, "{rect:?} in {:?}", line.rect);
+        assert!(rect.x1 < line.rect.x1 - 1.0, "{rect:?} in {:?}", line.rect);
+        assert!((rect.y0 - line.rect.y0).abs() < 0.01, "{rect:?}");
+    }
+
+    #[test]
     fn copies_a_selection_across_pages() {
         let fixture = open_fixture();
 
@@ -711,7 +751,11 @@ pub(crate) mod tests {
         );
         assert!(copied.contains("first item"), "{copied:?}");
         assert!(
-            copied.ends_with("closing remarks of the document."),
+            copied.contains("closing remarks of the document."),
+            "{copied:?}"
+        );
+        assert!(
+            copied.ends_with("described at https://example.com/docs."),
             "{copied:?}"
         );
         assert!(!copied.contains("Introduction"), "{copied:?}");
@@ -860,6 +904,7 @@ pub(crate) mod tests {
              ```\nlet answer = 42;\n```\n\n\
              ## Results\n\n\
              The second page holds the closing remarks of the document.\n\n\
+             It is described at https://example.com/docs.\n\n\
              Table 1: Scores by model.\n\n\
              | Model | Score | Cost |\n\
              | --- | --- | --- |\n\

@@ -26,6 +26,7 @@ page1 = text_ops([
 page2 = text_ops([
     ("F2", 16, 72, 720, "Results"),
     ("F1", 11, 72, 696, "The second page holds the closing remarks of the document."),
+    ("F1", 11, 72, 668, "It is described at https://example.com/docs."),
 ])
 
 # Page 3: two tables. The first is ruled only horizontally, as typeset tables
@@ -55,7 +56,8 @@ objects[2] = b"<< /Type /Pages /Kids [3 0 R 4 0 R 14 0 R] /Count 3 >>"
 res = b"<< /Font << /F1 7 0 R /F2 8 0 R /F3 9 0 R >> >>"
 objects[3] = (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R /Resources " + res
               + b" /Annots [17 0 R 18 0 R 19 0 R 20 0 R 21 0 R] >>")
-objects[4] = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 6 0 R /Resources " + res + b" >>"
+objects[4] = (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 6 0 R /Resources " + res
+              + b" /Annots [22 0 R 23 0 R] >>")
 objects[5] = b"<< /Length %d >>\nstream\n" % len(page1) + page1 + b"\nendstream"
 objects[6] = b"<< /Length %d >>\nstream\n" % len(page2) + page2 + b"\nendstream"
 objects[7] = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
@@ -81,6 +83,12 @@ objects[18] = link % (72, 653, 200, 667, b"/A << /S /URI /URI (https://example.c
 objects[19] = link % (72, 597, 200, 611, b"/Dest [4 0 R /XYZ 72 740 0]")
 objects[20] = link % (72, 569, 140, 583, b"/A << /S /GoTo /D [14 0 R /Fit] >>")
 objects[21] = link % (72, 555, 140, 569, b"/A << /S /Launch /F (cmd.exe) >>")
+# On the second page, an address with a letter outside ASCII, written as the
+# single byte that older producers write it as.
+objects[22] = link % (72, 692, 200, 706, b"/A << /S /URI /URI (http://example.com/b\xfasqueda#caf\xe9) >>")
+# And over the start of the address written out below, a link to that much
+# of it: what some producers make of an address they cannot follow.
+objects[23] = link % (160, 665, 250, 679, b"/A << /S /URI /URI (https://example.com/) >>")
 
 out = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
 offsets = {}

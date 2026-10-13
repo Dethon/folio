@@ -10,7 +10,7 @@ endobj
 << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R /Resources << /Font << /F1 7 0 R /F2 8 0 R /F3 9 0 R >> >> /Annots [17 0 R 18 0 R 19 0 R 20 0 R 21 0 R] >>
 endobj
 4 0 obj
-<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 6 0 R /Resources << /Font << /F1 7 0 R /F2 8 0 R /F3 9 0 R >> >> >>
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 6 0 R /Resources << /Font << /F1 7 0 R /F2 8 0 R /F3 9 0 R >> >> /Annots [22 0 R 23 0 R] >>
 endobj
 5 0 obj
 << /Length 596 >>
@@ -29,11 +29,12 @@ ET
 endstream
 endobj
 6 0 obj
-<< /Length 138 >>
+<< /Length 216 >>
 stream
 BT
 /F2 16 Tf 1 0 0 1 72 720 Tm (Results) Tj
 /F1 11 Tf 1 0 0 1 72 696 Tm (The second page holds the closing remarks of the document.) Tj
+/F1 11 Tf 1 0 0 1 72 668 Tm (It is described at https://example.com/docs.) Tj
 ET
 endstream
 endobj
@@ -117,32 +118,40 @@ endobj
 21 0 obj
 << /Type /Annot /Subtype /Link /Border [0 0 0] /Rect [72 555 140 569] /A << /S /Launch /F (cmd.exe) >> >>
 endobj
+22 0 obj
+<< /Type /Annot /Subtype /Link /Border [0 0 0] /Rect [72 692 200 706] /A << /S /URI /URI (http://example.com/búsqueda#café) >> >>
+endobj
+23 0 obj
+<< /Type /Annot /Subtype /Link /Border [0 0 0] /Rect [160 665 250 679] /A << /S /URI /URI (https://example.com/) >> >>
+endobj
 xref
-0 22
+0 24
 0000000000 65535 f 
 0000000015 00000 n 
 0000000104 00000 n 
 0000000174 00000 n 
 0000000365 00000 n 
-0000000511 00000 n 
-0000001158 00000 n 
-0000001347 00000 n 
-0000001444 00000 n 
+0000000535 00000 n 
+0000001182 00000 n 
+0000001449 00000 n 
 0000001546 00000 n 
-0000001641 00000 n 
-0000001715 00000 n 
-0000001815 00000 n 
-0000001910 00000 n 
-0000001957 00000 n 
-0000002132 00000 n 
-0000003078 00000 n 
-0000003247 00000 n 
-0000003328 00000 n 
-0000003471 00000 n 
-0000003588 00000 n 
-0000003712 00000 n 
+0000001648 00000 n 
+0000001743 00000 n 
+0000001817 00000 n 
+0000001917 00000 n 
+0000002012 00000 n 
+0000002059 00000 n 
+0000002234 00000 n 
+0000003180 00000 n 
+0000003349 00000 n 
+0000003430 00000 n 
+0000003573 00000 n 
+0000003690 00000 n 
+0000003814 00000 n 
+0000003936 00000 n 
+0000004082 00000 n 
 trailer
-<< /Size 22 /Root 1 0 R /Info 13 0 R >>
+<< /Size 24 /Root 1 0 R /Info 13 0 R >>
 startxref
-3834
+4217
 %%EOF
