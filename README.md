@@ -94,6 +94,8 @@ is defined in `installer/folio.nsi`.
 The icon is drawn in `assets/icon/folio.svg`; after changing it, run
 `cargo run --example make-icon` to regenerate the `.ico`, the window icon and
 the installer artwork.
+`build.rs` links the `.ico` into `folio.exe` as its icon; it writes the
+resource file itself, so the cross-build needs no resource compiler.
 
 However it is shipped, `folio.exe` and `pdfium.dll` must stay together.
 
@@ -244,10 +246,6 @@ examples/make-icon.rs  renders the icon artwork to .ico / .png / .bmp
   flattened (Markdown has none), a table continuing onto the next page
   becomes two tables, and images are not extracted.
 - Printing outside Windows hands the whole file to `lp`.
-- `folio.exe` itself carries no icon resource (that needs a resource compiler
-  the cross-build does not have), so the bare file shows a generic icon in
-  Explorer. The window, the Start menu shortcut and the installed-apps entry
-  all show Folio's icon.
 - The installer is unsigned.
 
 ## Licence
