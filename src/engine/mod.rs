@@ -918,6 +918,51 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn engines_share_the_library_without_harm() {
+        // Each on a thread of its own, with nothing to keep them apart but
+        // the engines themselves: a document read while another is being
+        // parsed or drawn comes back whole.
+        let readers: Vec<_> = (0..16)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    for _ in 0..4 {
+                        let fixture = open_fixture();
+
+                        assert_eq!(fixture.doc.pages.len(), 3);
+                        assert_eq!(fixture.doc.outline.len(), 2);
+
+                        fixture.want(Wanted {
+                            tiles: vec![TileKey {
+                                page: 0,
+                                scale: 2.0f32.to_bits(),
+                                col: 0,
+                                row: 0,
+                            }],
+                            texts: vec![0, 1, 2],
+                            ..Wanted::default()
+                        });
+
+                        let glyphs: usize = (0..3)
+                            .map(|_| {
+                                fixture.wait(|event| match event {
+                                    Event::Text { text, .. } => Some(text.glyphs.len()),
+                                    _ => None,
+                                })
+                            })
+                            .sum();
+
+                        assert!(glyphs > 500, "{glyphs} glyphs");
+                    }
+                })
+            })
+            .collect();
+
+        for reader in readers {
+            reader.join().expect("the document was read whole");
+        }
+    }
+
+    #[test]
     fn reports_files_that_are_not_pdfs() {
         let (sender, events) = mpsc::channel();
         let engine = Engine::spawn(move |event| {
