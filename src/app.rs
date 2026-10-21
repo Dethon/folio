@@ -101,7 +101,7 @@ pub enum Message {
     FindStep(i8),
     Escape,
     Key(keyboard::Event),
-    Window(window::Event),
+    FileDropped(PathBuf),
     ScaleFactor(f32),
     Tick(Instant),
     /// A frame of the scroll test.
@@ -277,7 +277,7 @@ impl App {
         let mut subscriptions = vec![
             keyboard::listen().map(Message::Key),
             iced::event::listen_with(escape),
-            window::events().map(|(_, event)| Message::Window(event)),
+            iced::event::listen_with(window_event),
         ];
 
         if self.toast.is_some()
@@ -692,11 +692,7 @@ impl App {
                 self.modifiers = modifiers;
             }
             Message::Key(_) => {}
-            Message::Window(event) => match event {
-                window::Event::FileDropped(path) => self.open(path),
-                window::Event::Rescaled(scale_factor) => self.set_scale_factor(scale_factor),
-                _ => {}
-            },
+            Message::FileDropped(path) => self.open(path),
             Message::ScaleFactor(scale_factor) => self.set_scale_factor(scale_factor),
             Message::Tick(now) => {
                 if self
@@ -1016,6 +1012,23 @@ fn escape(
             key: Key::Named(Named::Escape),
             ..
         }) => Some(Message::Escape),
+        _ => None,
+    }
+}
+
+/// The window events the app acts on. The rest are left out on purpose:
+/// every message rebuilds the view and redraws, and Windows reports a move
+/// for each step of dragging the window, which made the drag stutter.
+fn window_event(
+    event: iced::Event,
+    _status: iced::event::Status,
+    _window: window::Id,
+) -> Option<Message> {
+    match event {
+        iced::Event::Window(window::Event::FileDropped(path)) => Some(Message::FileDropped(path)),
+        iced::Event::Window(window::Event::Rescaled(scale_factor)) => {
+            Some(Message::ScaleFactor(scale_factor))
+        }
         _ => None,
     }
 }
